@@ -2963,7 +2963,7 @@ async function createV5MessageContextObject(args: {
 		source: "message-service",
 		stable: false,
 		content:
-			'current_turn_boundary: The prior_message blocks above are context only. If a reply_reference block follows, it is the platform message that the final message:user is replying to; use it only to resolve references such as this/that/it. Execute and answer only the final message:user below. Do not merge separate prior requests into the current task unless the final message explicitly references them. Exception for visible-context recall: when the final message asks a recall question about what was said in this conversation (who mentioned X, did anyone bring up Y, what did I say about Z, what was the last message, did you yourself say W), you may scan the prior_message blocks above and answer from what is literally visible there. This recall exception covers only what was literally SAID in the visible chat. It does NOT cover the user\'s tracked work: a recap, status, or what-did-I-get-done ask about their todos, tasks, reminders, habits, goals, notes, or day ("recap my day", "what\'s left today", "did I finish everything", "how did I do this week") is a live tasks lookup, not chat recall — route it to the tasks tools and answer from what they return; never report an empty or missing day from the visible window alone.' +
+			'current_turn_boundary: The prior_message blocks in this request are context only. If a reply_reference block is present, it is the platform message that the final message:user is replying to; use it only to resolve references such as this/that/it. Execute and answer only the final message:user. Do not merge separate prior requests into the current task unless the final message explicitly references them. Exception for visible-context recall: when the final message asks a recall question about what was said in this conversation (who mentioned X, did anyone bring up Y, what did I say about Z, what was the last message, did you yourself say W), you may scan the prior_message blocks in this request and answer from what is literally visible there. This recall exception covers only what was literally SAID in the visible chat. It does NOT cover the user\'s tracked work: a recap, status, or what-did-I-get-done ask about their todos, tasks, reminders, habits, goals, notes, or day ("recap my day", "what\'s left today", "did I finish everything", "how did I do this week") is a live tasks lookup, not chat recall — route it to the tasks tools and answer from what they return; never report an empty or missing day from the visible window alone.' +
 			// Only the chat-recall context renders the agent's own prior turns;
 			// the tool-planner context deliberately omits them (stale-answer
 			// hazard), so this grounding sentence would be false there.
@@ -4019,10 +4019,37 @@ function renderMessageHandlerModelInput(
 	const dynamicSegments = rendered.promptSegments.filter(
 		(segment) => !segment.stable,
 	);
+	const currentTurnBoundary = dynamicSegments.filter(
+		(segment) => segment.id === "current-turn-boundary",
+	);
+	const remainingDynamicSegments = dynamicSegments.filter(
+		(segment) => segment.id !== "current-turn-boundary",
+	);
+	const priorDialogueSegments = remainingDynamicSegments.filter(
+		(segment) => segment.label?.startsWith("prior_message:") === true,
+	);
+	const dynamicProviderSegments = remainingDynamicSegments.filter(
+		(segment) => segment.label?.startsWith("provider:") === true,
+	);
+	const turnTailSegments = remainingDynamicSegments.filter(
+		(segment) =>
+			segment.label?.startsWith("prior_message:") !== true &&
+			segment.label?.startsWith("provider:") !== true,
+	);
+	// This invariant contract anchors the user-message prefix before volatile
+	// provider output, followed by chronological dialogue whose older portion is
+	// append-only. Keeping it in the user message preserves the distinction between
+	// agent identity and instructions for interpreting turn-local blocks.
+	const orderedDynamicSegments = [
+		...currentTurnBoundary,
+		...priorDialogueSegments,
+		...dynamicProviderSegments,
+		...turnTailSegments,
+	];
 	const promptSegments = normalizePromptSegments([
 		...stableSegments,
 		{ content: `message_handler_stage:\n${instructions}`, stable: true },
-		...dynamicSegments,
+		...orderedDynamicSegments,
 	]);
 	const systemContent = normalizePromptSegments([
 		...stableSegments,
@@ -4030,7 +4057,7 @@ function renderMessageHandlerModelInput(
 	])
 		.map(segmentBlock)
 		.join("\n\n");
-	const userContent = normalizePromptSegments(dynamicSegments)
+	const userContent = normalizePromptSegments(orderedDynamicSegments)
 		.map(segmentBlock)
 		.join("\n\n");
 	return {

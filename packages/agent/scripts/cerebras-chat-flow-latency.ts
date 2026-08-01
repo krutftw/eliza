@@ -59,6 +59,69 @@ export interface ModelUsageEvidence {
   };
 }
 
+export interface PromptCacheTelemetry {
+  promptTokens: Distribution;
+  cachedPromptTokens: Distribution;
+  uncachedPromptTokens: Distribution;
+  cacheRatePercent: Distribution;
+}
+
+export interface ModelInputContext {
+  phase: "warmup" | "sample" | "cancellation";
+  index?: number;
+  proof: string;
+}
+
+export interface ModelInputEvidence {
+  context: ModelInputContext | null;
+  modelType: string;
+  prompt?: string;
+  messages?: unknown;
+  promptSegments?: unknown;
+  tools?: unknown;
+  responseSchema?: unknown;
+  providerOptions?: unknown;
+  maxTokens?: number;
+  stream?: boolean;
+}
+
+function jsonEvidence(value: unknown): unknown {
+  return JSON.parse(JSON.stringify(value));
+}
+
+export function captureModelInput(
+  modelType: unknown,
+  params: unknown,
+  context: ModelInputContext | null,
+): ModelInputEvidence {
+  const input =
+    params && typeof params === "object"
+      ? (params as Record<string, unknown>)
+      : {};
+  return {
+    context: context ? { ...context } : null,
+    modelType: String(modelType),
+    ...(typeof input.prompt === "string" ? { prompt: input.prompt } : {}),
+    ...(input.messages !== undefined
+      ? { messages: jsonEvidence(input.messages) }
+      : {}),
+    ...(input.promptSegments !== undefined
+      ? { promptSegments: jsonEvidence(input.promptSegments) }
+      : {}),
+    ...(input.tools !== undefined ? { tools: jsonEvidence(input.tools) } : {}),
+    ...(input.responseSchema !== undefined
+      ? { responseSchema: jsonEvidence(input.responseSchema) }
+      : {}),
+    ...(input.providerOptions !== undefined
+      ? { providerOptions: jsonEvidence(input.providerOptions) }
+      : {}),
+    ...(typeof input.maxTokens === "number"
+      ? { maxTokens: input.maxTokens }
+      : {}),
+    ...(typeof input.stream === "boolean" ? { stream: input.stream } : {}),
+  };
+}
+
 export function modelUsageEvidence(
   payload: ModelEventPayload,
   expectedModel: string,
@@ -152,6 +215,54 @@ export function distribution(samples: readonly number[]): Distribution {
   };
 }
 
+export function promptCacheTelemetry(
+  turns: readonly {
+    modelUsage: {
+      tokens: {
+        prompt: number;
+        cachedInputTokens?: number;
+        cacheReadInputTokens?: number;
+      };
+    };
+  }[],
+): PromptCacheTelemetry {
+  const promptTokens: number[] = [];
+  const cachedPromptTokens: number[] = [];
+  const uncachedPromptTokens: number[] = [];
+  const cacheRatePercent: number[] = [];
+  for (const turn of turns) {
+    const prompt = turn.modelUsage.tokens.prompt;
+    const cached =
+      turn.modelUsage.tokens.cachedInputTokens ??
+      turn.modelUsage.tokens.cacheReadInputTokens;
+    if (!Number.isFinite(prompt) || prompt <= 0) {
+      throw new Error(
+        "Cerebras cache telemetry requires positive prompt tokens",
+      );
+    }
+    if (cached === undefined || !Number.isFinite(cached) || cached < 0) {
+      throw new Error(
+        "Cerebras cache telemetry requires provider-reported cached prompt tokens",
+      );
+    }
+    if (cached > prompt) {
+      throw new Error(
+        `Cerebras reported more cached tokens than prompt tokens: ${cached} > ${prompt}`,
+      );
+    }
+    promptTokens.push(prompt);
+    cachedPromptTokens.push(cached);
+    uncachedPromptTokens.push(prompt - cached);
+    cacheRatePercent.push((cached / prompt) * 100);
+  }
+  return {
+    promptTokens: distribution(promptTokens),
+    cachedPromptTokens: distribution(cachedPromptTokens),
+    uncachedPromptTokens: distribution(uncachedPromptTokens),
+    cacheRatePercent: distribution(cacheRatePercent),
+  };
+}
+
 export function verifyProofResponse(response: string, proof: string): void {
   const normalized = response.toUpperCase().replace(/[^A-Z0-9-]/g, "");
   if (!normalized.includes(proof.toUpperCase())) {
@@ -241,6 +352,17 @@ async function main(): Promise<void> {
     runtime.registerEvent(EventType.MODEL_USED, async (payload) => {
       modelUsageEvents.push(payload);
     });
+    const modelInputs: ModelInputEvidence[] = [];
+    let activeModelInputContext: ModelInputContext | null = null;
+    const measuredUseModel = runtime.useModel.bind(runtime);
+    runtime.useModel = (async (modelType, params) => {
+      if (modelType === ModelType.RESPONSE_HANDLER) {
+        modelInputs.push(
+          captureModelInput(modelType, params, activeModelInputContext),
+        );
+      }
+      return await measuredUseModel(modelType, params);
+    }) as typeof runtime.useModel;
     const worldId = randomUUID() as UUID;
     const roomId = randomUUID() as UUID;
     const entityId = randomUUID() as UUID;
@@ -278,16 +400,26 @@ async function main(): Promise<void> {
       const streamed: string[] = [];
       const usageEventOffset = modelUsageEvents.length;
       const startedAt = performance.now();
-      const result = await generateChatResponse(
-        runtime,
-        message as Memory,
-        runtime.character.name,
-        {
-          onChunk: (chunk) => {
-            streamed.push(chunk);
+      activeModelInputContext = {
+        phase: warmup ? "warmup" : "sample",
+        index,
+        proof,
+      };
+      let result: Awaited<ReturnType<typeof generateChatResponse>>;
+      try {
+        result = await generateChatResponse(
+          runtime,
+          message as Memory,
+          runtime.character.name,
+          {
+            onChunk: (chunk) => {
+              streamed.push(chunk);
+            },
           },
-        },
-      );
+        );
+      } finally {
+        activeModelInputContext = null;
+      }
       const wallMs = performance.now() - startedAt;
       const turnUsageEvents = modelUsageEvents.slice(usageEventOffset);
       const modelUsagePayload = turnUsageEvents[0];
@@ -446,6 +578,10 @@ async function main(): Promise<void> {
 
     const cancellationStartedAt = performance.now();
     let cancellationError: unknown;
+    activeModelInputContext = {
+      phase: "cancellation",
+      proof: cancellationProof,
+    };
     try {
       await generateChatResponse(
         runtime,
@@ -457,6 +593,7 @@ async function main(): Promise<void> {
     } catch (error) {
       cancellationError = error;
     } finally {
+      activeModelInputContext = null;
       runtime.useModel = originalUseModel;
       if (cancellationTimer) clearTimeout(cancellationTimer);
     }
@@ -584,6 +721,7 @@ async function main(): Promise<void> {
       totalToQuiescenceMs: distribution(
         turns.map((turn) => turn.totalToQuiescenceMs),
       ),
+      promptCache: promptCacheTelemetry(turns),
       stageHistograms: stageHistograms(chatTelemetry.flows),
       derivedHistograms: chatTelemetry.derivedHistograms satisfies Record<
         string,
@@ -591,6 +729,7 @@ async function main(): Promise<void> {
       >,
       spanHistograms: chatTelemetry.spanHistograms,
       providerTelemetry: chatTelemetry.providers,
+      modelInputs,
       cancellationProbe,
       allProviderSweep: {
         execution:

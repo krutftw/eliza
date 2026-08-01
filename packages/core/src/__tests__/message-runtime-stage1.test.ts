@@ -3028,10 +3028,13 @@ describe("runV5MessageRuntimeStage1", () => {
 		expect(userContent).not.toContain("[sub-agent: old build");
 		expect(userContent).not.toContain("stale raw transcript");
 		expect(userContent).toContain("Can you check my calendar?");
-		expect(userContent.indexOf("prior_message:user:")).toBeLessThan(
-			userContent.indexOf("current_turn_boundary:"),
-		);
 		expect(userContent.indexOf("current_turn_boundary:")).toBeLessThan(
+			userContent.indexOf("prior_message:user:"),
+		);
+		expect(userContent.indexOf("prior_message:user:")).toBeLessThan(
+			userContent.indexOf("# Runtime Model Context"),
+		);
+		expect(userContent.indexOf("# Runtime Model Context")).toBeLessThan(
 			userContent.lastIndexOf("message:user:"),
 		);
 		expect(userContent).not.toContain("user_role:");
@@ -3123,7 +3126,7 @@ describe("runV5MessageRuntimeStage1", () => {
 			"who mentioned X, did anyone bring up Y, what did I say about Z, what was the last message",
 		);
 		expect(sourceText).toContain(
-			"you may scan the prior_message blocks above and answer from what is literally visible there",
+			"you may scan the prior_message blocks in this request and answer from what is literally visible there",
 		);
 		expect(sourceText).toContain(
 			"Only when the asked-about token appears neither in the current message nor in any visible prior_message block, say so plainly",

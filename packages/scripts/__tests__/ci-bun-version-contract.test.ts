@@ -4,8 +4,9 @@
  * comment ignored), and each failure mode the contract exists to catch is
  * exercised red: divergent concrete pin, floating literal/env/matrix cell,
  * mutable action tag, implicit setup-bun, expressions whose backing
- * declaration is missing (env, matrix, and composite step-output forms),
- * unpinned bun.sh/install, Dockerfile ARG/FROM drift, divergent release
+ * declaration is missing or lives in another job (env, matrix, and composite
+ * step-output forms), unpinned bun.sh/install, unbound shell/cache variables,
+ * Dockerfile ARG/FROM drift and unbound interpolation, divergent release
  * downloads (including releases/latest), presence-only install guards,
  * drifting packageManager and root type anchors, floating
  * composite-action defaults, allowlist entries that lack a reason or a
@@ -306,6 +307,29 @@ jobs:
     );
   });
 
+  test("fails an env expression backed only by another job", () => {
+    const wrongJob = `name: Lane
+on: [push]
+jobs:
+  declares:
+    runs-on: ubuntu-24.04
+    env:
+      BUN_VERSION: "${CANONICAL}"
+    steps:
+      - run: bun --version
+  uses:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: \${{ env.BUN_VERSION }}
+`;
+    expectViolation(
+      buildRepo({ extra: { "wrong-job-env.yml": wrongJob } }),
+      /unbound expression.*job "uses" has no effective BUN_VERSION declaration/,
+    );
+  });
+
   test("fails a matrix expression with no bun-version cells to resolve", () => {
     const unbacked = `name: Lane
 on: [push]
@@ -320,6 +344,30 @@ jobs:
     expectViolation(
       buildRepo({ extra: { "unbacked-matrix.yml": unbacked } }),
       /unbound expression.*no bun-version matrix cells/,
+    );
+  });
+
+  test("fails a matrix expression backed only by another job", () => {
+    const wrongJob = `name: Lane
+on: [push]
+jobs:
+  declares:
+    strategy:
+      matrix:
+        bun-version: ["${CANONICAL}"]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: bun --version
+  uses:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: \${{ matrix.bun-version }}
+`;
+    expectViolation(
+      buildRepo({ extra: { "wrong-job-matrix.yml": wrongJob } }),
+      /unbound expression.*job "uses" has no bun-version matrix cells/,
     );
   });
 
@@ -384,6 +432,43 @@ jobs:
         },
       }),
       /deploy\/install\.sh:1: bun\.sh\/install without the pinned release tag/,
+    );
+  });
+
+  test("fails a shell install whose BUN_VERSION variable has no canonical default", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "deploy/install.sh":
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: shell variable syntax, not a JS template
+            'curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"\n',
+        },
+      }),
+      /unbound shell variable.*no earlier canonical BUN_VERSION default/,
+    );
+  });
+
+  test("fails a workflow cache variable backed only by another job", () => {
+    const wrongJob = `name: Cache
+on: [push]
+jobs:
+  declares:
+    runs-on: ubuntu-24.04
+    env:
+      BUN_VERSION: "${CANONICAL}"
+    steps:
+      - run: bun --version
+  caches:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.bun/install/cache
+          key: bun-\${BUN_VERSION}
+`;
+    expectViolation(
+      buildRepo({ extra: { "wrong-job-cache.yml": wrongJob } }),
+      /unbound shell\/cache variable.*job "caches" has no effective canonical BUN_VERSION/,
     );
   });
 
@@ -462,7 +547,36 @@ jobs:
     const install = inventory.find(
       (s) => s.surface === "shell-install" && s.file === "runner/Dockerfile",
     );
-    expect(install?.classification).toBe("canonical");
+    expect(install?.classification).toBe("resolvable-expression");
+  });
+
+  test("fails an interpolated oven/bun base image without a canonical global ARG", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "sim/Dockerfile":
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
+            "FROM oven/bun:${BUN_VERSION}\n",
+        },
+      }),
+      /FROM oven\/bun:\$\{BUN_VERSION\}.*no earlier canonical global ARG BUN_VERSION/,
+    );
+  });
+
+  test("fails a Docker shell variable without a canonical stage ARG", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "runner/Dockerfile": [
+            "FROM node:24-slim",
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
+            'RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"',
+            "",
+          ].join("\n"),
+        },
+      }),
+      /unbound shell variable.*no canonical BUN_VERSION ARG\/ENV in this stage/,
+    );
   });
 
   test("fails a divergent oven-sh release download URL", () => {
@@ -634,6 +748,7 @@ jobs:
         floatingAllowlist: [
           {
             file: ".github/workflows/compat.yml",
+            job: "canary-cell",
             value: "canary",
             reason: "upstream compatibility cell (test)",
           },
@@ -645,21 +760,16 @@ jobs:
   test("permits an allowlisted floating cell beside a canonical lane", () => {
     const additive = `name: Compat
 on: [push]
-env:
-  BUN_VERSION: "${CANONICAL}"
 jobs:
-  pinned:
+  compatibility:
+    strategy:
+      matrix:
+        bun-version: ["${CANONICAL}", "canary"]
     runs-on: ubuntu-24.04
     steps:
       - uses: oven-sh/setup-bun@${SHA}
         with:
-          bun-version: \${{ env.BUN_VERSION }}
-  canary-cell:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: oven-sh/setup-bun@${SHA}
-        with:
-          bun-version: canary
+          bun-version: \${{ matrix.bun-version }}
 `;
     const inventory = inventoryOf(
       buildRepo({ extra: { "compat.yml": additive } }),
@@ -667,6 +777,7 @@ jobs:
         floatingAllowlist: [
           {
             file: ".github/workflows/compat.yml",
+            job: "compatibility",
             value: "canary",
             reason: "upstream compatibility cell (test)",
           },
@@ -677,6 +788,42 @@ jobs:
       (s) => s.file === ".github/workflows/compat.yml" && s.value === "canary",
     );
     expect(site?.classification).toBe("allowlisted-floating");
+  });
+
+  test("rejects a canonical sibling that exists only in another job", () => {
+    const wrongScope = `name: Compat
+on: [push]
+jobs:
+  pinned:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: "${CANONICAL}"
+  compatibility:
+    strategy:
+      matrix:
+        bun-version: ["canary"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: \${{ matrix.bun-version }}
+`;
+    expectViolation(
+      buildRepo({ extra: { "compat.yml": wrongScope } }),
+      /job "compatibility" has no canonical sibling matrix lane/,
+      {
+        floatingAllowlist: [
+          {
+            file: ".github/workflows/compat.yml",
+            job: "compatibility",
+            value: "canary",
+            reason: "upstream compatibility cell (test)",
+          },
+        ],
+      },
+    );
   });
 
   test("classifyTypeRange models the syntaxes this repo uses", () => {

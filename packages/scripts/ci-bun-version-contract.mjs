@@ -62,6 +62,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isMap, isScalar, isSeq, parseDocument } from "yaml";
 
 const DEFAULT_REPO_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -81,12 +82,12 @@ const REVIEWED_SETUP_BUN_SHAS = new Set([
 ]);
 
 // Non-authoritative floating cells, e.g. an upstream Bun compatibility matrix
-// that runs IN ADDITION to the pinned lane. Each entry scopes one file plus
-// the exact floating value it may wire, and must carry a non-empty reason;
-// the file must also wire the canonical pin somewhere (additive-only — a
-// canary can never be a file's sole runtime). Empty by design: no surface
-// currently has a sanctioned reason to float, and an entry added here is a
-// reviewable diff rather than silent drift.
+// that runs IN ADDITION to the pinned lane. Each entry scopes one file, job,
+// and exact floating matrix value, and must carry a non-empty reason. The same
+// job's matrix must also contain the canonical pin (additive-only — a canary
+// can never borrow a stable lane from some unrelated job). Empty by design: no
+// surface currently has a sanctioned reason to float, and an entry added here
+// is a reviewable diff rather than silent drift.
 const FLOATING_ALLOWLIST = [];
 
 // Deliberately excluded surfaces, inventoried so the exclusion is visible
@@ -222,10 +223,274 @@ const ENV_EXPRESSION = /^\$\{\{\s*env\.BUN_VERSION\s*\}\}$/;
 const MATRIX_EXPRESSION = /^\$\{\{\s*matrix\.bun-version\s*\}\}$/;
 const INPUTS_EXPRESSION = /^\$\{\{\s*inputs\.bun-version\s*\}\}$/;
 
-function isAllowlisted(allowlist, file, value) {
+function isAllowlisted(allowlist, file, job, value) {
   return allowlist.some(
-    (entry) => entry.file === file && entry.value === value,
+    (entry) =>
+      entry.file === file && entry.job === job && entry.value === value,
   );
+}
+
+function scalarKey(pair) {
+  return isScalar(pair.key) && typeof pair.key.value === "string"
+    ? pair.key.value
+    : undefined;
+}
+
+function mappingValue(mapping, key) {
+  if (!isMap(mapping)) return undefined;
+  return mapping.items.find((pair) => scalarKey(pair) === key)?.value;
+}
+
+function scalarValue(node) {
+  if (!isScalar(node)) return null;
+  if (typeof node.value === "string") return node.value;
+  if (node.value === null || node.value === undefined) return null;
+  return String(node.value);
+}
+
+function lineAtOffset(text, offset) {
+  return text.slice(0, Math.max(0, offset)).split("\n").length;
+}
+
+function nodeLines(text, node) {
+  if (!Array.isArray(node?.range)) return { start: 1, end: 1 };
+  return {
+    start: lineAtOffset(text, node.range[0]),
+    end: lineAtOffset(text, node.range[1]),
+  };
+}
+
+function versionNodes(node) {
+  if (isSeq(node)) return node.items.filter((item) => item !== null);
+  return node === undefined ? [] : [node];
+}
+
+function collectVariableScalars(node, text, context, out) {
+  if (isScalar(node)) {
+    const value = scalarValue(node);
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell variable syntax, not a JS template
+    if (value?.includes("${BUN_VERSION}")) {
+      const range = nodeLines(text, node);
+      out.push({ ...context, ...range, value });
+    }
+    return;
+  }
+  if (isMap(node)) {
+    for (const pair of node.items) {
+      collectVariableScalars(pair.value, text, context, out);
+    }
+    return;
+  }
+  if (isSeq(node)) {
+    for (const item of node.items) {
+      collectVariableScalars(item, text, context, out);
+    }
+  }
+}
+
+function parseYamlSurface(rel, kind, text) {
+  const document = parseDocument(text, {
+    merge: false,
+    prettyErrors: true,
+    uniqueKeys: true,
+  });
+  if (document.errors.length > 0) {
+    throw new Error(
+      `${rel}: tracked ${kind} failed to parse as YAML — cannot verify its Bun scopes (${document.errors[0].message})`,
+    );
+  }
+  if (!isMap(document.contents)) {
+    throw new Error(
+      `${rel}: tracked ${kind} must have a YAML mapping root to verify its Bun scopes.`,
+    );
+  }
+
+  const values = [];
+  const setupBunUses = [];
+  const variableUses = [];
+  let compositeDefault = null;
+
+  const addValue = ({
+    node,
+    key,
+    origin,
+    job,
+    step,
+    envBinding,
+    matrixCells,
+    inputDefault,
+  }) => {
+    for (const item of versionNodes(node)) {
+      values.push({
+        key,
+        raw: scalarValue(item),
+        line: nodeLines(text, item).start,
+        origin,
+        job,
+        step,
+        envBinding,
+        matrixCells: matrixCells ?? [],
+        inputDefault,
+      });
+    }
+  };
+
+  const collectSteps = ({
+    steps,
+    job,
+    workflowEnv,
+    jobEnv,
+    matrixCells,
+    inputDefault,
+  }) => {
+    if (!isSeq(steps)) return;
+    for (const [step, stepNode] of steps.items.entries()) {
+      if (!isMap(stepNode)) continue;
+      const stepEnv = mappingValue(
+        mappingValue(stepNode, "env"),
+        "BUN_VERSION",
+      );
+      const envBinding = stepEnv ?? jobEnv ?? workflowEnv;
+      if (stepEnv !== undefined) {
+        addValue({
+          node: stepEnv,
+          key: "BUN_VERSION",
+          origin: "step-env",
+          job,
+          step,
+          envBinding: undefined,
+          matrixCells,
+        });
+      }
+      const withNode = mappingValue(stepNode, "with");
+      const bunVersion = mappingValue(withNode, "bun-version");
+      if (bunVersion !== undefined) {
+        addValue({
+          node: bunVersion,
+          key: "bun-version",
+          origin: "step-with",
+          job,
+          step,
+          envBinding,
+          matrixCells,
+          inputDefault,
+        });
+      }
+
+      const usesNode = mappingValue(stepNode, "uses");
+      const uses = scalarValue(usesNode);
+      if (uses?.startsWith("oven-sh/setup-bun@")) {
+        setupBunUses.push({
+          ref: uses.slice("oven-sh/setup-bun@".length),
+          line: nodeLines(text, usesNode).start,
+          bunVersion,
+        });
+      }
+
+      const variableContext = {
+        job,
+        step,
+        envBinding,
+        matrixCells,
+        inputDefault,
+      };
+      collectVariableScalars(
+        mappingValue(stepNode, "run"),
+        text,
+        variableContext,
+        variableUses,
+      );
+      collectVariableScalars(withNode, text, variableContext, variableUses);
+    }
+  };
+
+  const root = document.contents;
+  if (kind === "action") {
+    const input = mappingValue(mappingValue(root, "inputs"), "bun-version");
+    const defaultNode = mappingValue(input, "default");
+    if (input !== undefined) {
+      compositeDefault = {
+        raw: scalarValue(defaultNode),
+        line: nodeLines(text, defaultNode ?? input).start,
+      };
+    }
+    const runs = mappingValue(root, "runs");
+    collectSteps({
+      steps: mappingValue(runs, "steps"),
+      job: "<composite>",
+      workflowEnv: undefined,
+      jobEnv: undefined,
+      matrixCells: [],
+      inputDefault: defaultNode,
+    });
+    return { values, setupBunUses, variableUses, compositeDefault };
+  }
+
+  const workflowEnv = mappingValue(mappingValue(root, "env"), "BUN_VERSION");
+  if (workflowEnv !== undefined) {
+    addValue({
+      node: workflowEnv,
+      key: "BUN_VERSION",
+      origin: "workflow-env",
+      job: null,
+      envBinding: undefined,
+      matrixCells: [],
+    });
+  }
+  const jobs = mappingValue(root, "jobs");
+  if (!isMap(jobs)) return { values, setupBunUses, variableUses };
+  for (const pair of jobs.items) {
+    const job = scalarKey(pair);
+    const jobNode = pair.value;
+    if (job === undefined || !isMap(jobNode)) continue;
+    const jobEnv = mappingValue(mappingValue(jobNode, "env"), "BUN_VERSION");
+    const matrixNode = mappingValue(
+      mappingValue(mappingValue(jobNode, "strategy"), "matrix"),
+      "bun-version",
+    );
+    const matrixCells = versionNodes(matrixNode);
+    if (jobEnv !== undefined) {
+      addValue({
+        node: jobEnv,
+        key: "BUN_VERSION",
+        origin: "job-env",
+        job,
+        envBinding: undefined,
+        matrixCells,
+      });
+    }
+    if (matrixNode !== undefined) {
+      addValue({
+        node: matrixNode,
+        key: "bun-version",
+        origin: "matrix-cell",
+        job,
+        envBinding: jobEnv ?? workflowEnv,
+        matrixCells,
+      });
+    }
+    const jobWith = mappingValue(jobNode, "with");
+    const jobBunVersion = mappingValue(jobWith, "bun-version");
+    if (jobBunVersion !== undefined) {
+      addValue({
+        node: jobBunVersion,
+        key: "bun-version",
+        origin: "job-with",
+        job,
+        envBinding: jobEnv ?? workflowEnv,
+        matrixCells,
+      });
+    }
+    collectSteps({
+      steps: mappingValue(jobNode, "steps"),
+      job,
+      workflowEnv,
+      jobEnv,
+      matrixCells,
+      inputDefault: undefined,
+    });
+  }
+  return { values, setupBunUses, variableUses };
 }
 
 // Minimal range check for the workspace type-anchor classification. Only the
@@ -330,6 +595,11 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
         `FLOATING_ALLOWLIST entry for ${entry.file ?? "<missing file>"} has no reason — a sanctioned floating cell must say why it exists.`,
       );
     }
+    if (typeof entry.job !== "string" || entry.job.trim().length === 0) {
+      violate(
+        `FLOATING_ALLOWLIST entry for ${entry.file ?? "<missing file>"} has no job scope — sanctioned compatibility cells must name their owning matrix job.`,
+      );
+    }
   }
 
   const tracked = trackedFiles(repoRoot);
@@ -362,18 +632,36 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
 
   for (const { rel, kind, text: preread } of yamlFiles) {
     const text = preread ?? read(rel);
-    const lines = text.split("\n");
-    const values = bunVersionValues(text);
-    const hasEnvDeclaration = values.some(
-      (v) => v.key === "BUN_VERSION" && !isExpression(v.raw),
-    );
-    const hasMatrixCells = values.some(
-      (v) => v.origin !== "scalar" && !isExpression(v.raw),
-    );
-    const hasCanonicalConcrete = values.some((v) => v.raw === canonical);
+    const analysis = parseYamlSurface(rel, kind, text);
+    const values = analysis.values;
+
+    const matrixCellIsValidated = (node, job) => {
+      const value = scalarValue(node);
+      return (
+        value === canonical ||
+        (FLOATING.has(value) && isAllowlisted(allowlist, rel, job, value))
+      );
+    };
+    const bindingResolves = (node, site) => {
+      const value = scalarValue(node);
+      if (value === canonical) return true;
+      if (MATRIX_EXPRESSION.test(value ?? "")) {
+        return (
+          site.matrixCells.length > 0 &&
+          site.matrixCells.every((cell) =>
+            matrixCellIsValidated(cell, site.job),
+          )
+        );
+      }
+      if (kind === "action" && INPUTS_EXPRESSION.test(value ?? "")) {
+        return scalarValue(site.inputDefault) === canonical;
+      }
+      return false;
+    };
 
     // Invariant 1: every wired value is canonical, resolvable, or allowlisted.
-    for (const { key, raw, line, origin } of values) {
+    for (const valueSite of values) {
+      const { key, raw, line, origin, job } = valueSite;
       const site = {
         surface: `${kind}-version`,
         file: rel,
@@ -381,28 +669,35 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
         key,
         origin,
         value: raw,
+        ...(job === null || job === undefined ? {} : { job }),
       };
-      if (isExpression(raw)) {
-        // An expression only counts as resolvable when the declaration it
-        // reads actually exists in this file — the declaration itself is
-        // validated by this same loop, so the indirection cannot hide a
-        // float. Composite inputs resolve against the input default checked
-        // by the composite rule below. Anything else (step outputs, unknown
-        // contexts, cross-file env) cannot be proven pinned statically.
+      if (typeof raw === "string" && isExpression(raw)) {
+        // Expressions are resolved inside the actual job/step scope parsed
+        // from the YAML AST. A declaration in another job cannot satisfy the
+        // expression, and every matrix cell in the owning job must itself be
+        // canonical or an explicitly sanctioned sibling compatibility lane.
         let resolvable = false;
         let missing = "";
         if (ENV_EXPRESSION.test(raw)) {
-          resolvable = hasEnvDeclaration;
-          missing = "no BUN_VERSION declaration in this file";
+          resolvable = bindingResolves(valueSite.envBinding, valueSite);
+          missing =
+            valueSite.envBinding === undefined
+              ? `job "${job ?? "<workflow>"}" has no effective BUN_VERSION declaration; no BUN_VERSION declaration is visible in its workflow/job/step scope`
+              : `job "${job ?? "<workflow>"}" has a BUN_VERSION declaration that does not resolve to the canonical ${canonical}`;
         } else if (MATRIX_EXPRESSION.test(raw)) {
-          resolvable = hasMatrixCells;
-          missing = "no bun-version matrix cells in this file";
+          resolvable =
+            valueSite.matrixCells.length > 0 &&
+            valueSite.matrixCells.every((cell) =>
+              matrixCellIsValidated(cell, job),
+            );
+          missing = `job "${job ?? "<workflow>"}" has no bun-version matrix cells that can be proven canonical or sanctioned`;
         } else if (kind === "action" && INPUTS_EXPRESSION.test(raw)) {
-          resolvable = /^ {2}bun-version:\s*$/m.test(text);
-          missing = "no bun-version input declared in this action";
+          resolvable = scalarValue(valueSite.inputDefault) === canonical;
+          missing =
+            "no canonical bun-version input default declared in this action";
         } else {
           missing =
-            "only same-file env.BUN_VERSION / matrix.bun-version / composite inputs.bun-version indirection is checkable";
+            "only effective job-scoped env.BUN_VERSION / matrix.bun-version / composite inputs.bun-version indirection is checkable";
         }
         record({
           ...site,
@@ -418,18 +713,22 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
         continue;
       }
       if (FLOATING.has(raw)) {
-        const sanctioned = isAllowlisted(allowlist, rel, raw);
+        const scopeMatched = isAllowlisted(allowlist, rel, job, raw);
+        const sanctioned = scopeMatched && origin === "matrix-cell";
         record({
           ...site,
-          classification: sanctioned ? "allowlisted-floating" : "floating",
+          classification: scopeMatched ? "allowlisted-floating" : "floating",
         });
-        if (!sanctioned) {
+        if (!scopeMatched) {
           violate(
-            `${rel}:${line}: wires floating Bun "${raw}". Every authoritative lane must stay pinned to ${canonical} (${VERSION_FILE}); a deliberate extra compatibility cell needs a FLOATING_ALLOWLIST entry.`,
+            `${rel}:${line}: job "${job ?? "<workflow>"}" wires floating Bun "${raw}". Every authoritative lane must stay pinned to ${canonical} (${VERSION_FILE}); a deliberate extra compatibility matrix cell needs a file/job-scoped FLOATING_ALLOWLIST entry.`,
           );
-        } else if (!hasCanonicalConcrete) {
+        } else if (
+          !sanctioned ||
+          !valueSite.matrixCells.some((cell) => scalarValue(cell) === canonical)
+        ) {
           violate(
-            `${rel}:${line}: allowlisted floating "${raw}" is this file's ONLY runtime — an allowlisted cell must run in addition to the canonical ${canonical} lane, never as the default or sole runtime (#17044).`,
+            `${rel}:${line}: allowlisted floating "${raw}" in job "${job ?? "<workflow>"}" has no canonical sibling matrix lane — it must run in addition to the canonical ${canonical} lane in the same job, never borrow a stable lane from another job or become the default/sole runtime (#17044).`,
           );
         }
         continue;
@@ -452,94 +751,93 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
       }
     }
 
-    // Invariant 2: setup-bun refs are reviewed SHAs and never implicit.
-    for (let i = 0; i < lines.length; i++) {
-      const use = lines[i].match(
-        /^(\s*)(?:-\s+)?uses:\s*["']?oven-sh\/setup-bun@([^\s"']+)["']?/,
-      );
-      if (!use) continue;
-      const ref = use[2];
+    // Invariant 2: setup-bun refs are reviewed SHAs and never implicit. The
+    // owning step and its `with` mapping come from the parsed YAML tree.
+    for (const use of analysis.setupBunUses) {
+      const { ref, line, bunVersion } = use;
       const refSite = {
         surface: "setup-bun-ref",
         file: rel,
-        line: i + 1,
+        line,
         value: ref,
       };
       if (!reviewedShas.has(ref)) {
         record({ ...refSite, classification: "unreviewed-ref" });
         violate(
-          `${rel}:${i + 1}: oven-sh/setup-bun@${ref} is not pinned to a reviewed commit SHA — mutable tags can repoint. Pin one of: ${[...reviewedShas].join(", ")}.`,
+          `${rel}:${line}: oven-sh/setup-bun@${ref} is not pinned to a reviewed commit SHA — mutable tags can repoint. Pin one of: ${[...reviewedShas].join(", ")}.`,
         );
       } else {
         record({ ...refSite, classification: "reviewed-sha" });
       }
-
-      // Locate the step block around this `uses` and require an explicit
-      // bun-version inside it: setup-bun's own default is floating `latest`.
-      const stepIndent = use[1].length;
-      let start = i;
-      for (let j = i; j >= 0; j--) {
-        const dash = lines[j].match(/^(\s*)-\s/);
-        if (dash && dash[1].length <= stepIndent) {
-          start = j;
-          break;
-        }
-      }
-      let end = lines.length;
-      const startIndent = (lines[start].match(/^(\s*)/) ?? ["", ""])[1].length;
-      for (let j = start + 1; j < lines.length; j++) {
-        const dash = lines[j].match(/^(\s*)-\s/);
-        const dedent = lines[j].match(/^(\s*)\S/);
-        if (
-          (dash && dash[1].length <= startIndent) ||
-          (dedent && dedent[1].length < startIndent)
-        ) {
-          end = j;
-          break;
-        }
-      }
-      const step = lines.slice(start, end).join("\n");
-      if (!/^\s*bun-version:/m.test(step)) {
+      if (bunVersion === undefined) {
         record({
           surface: "setup-bun-version",
           file: rel,
-          line: i + 1,
+          line,
           value: null,
           classification: "implicit",
         });
         violate(
-          `${rel}:${i + 1}: oven-sh/setup-bun use wires no bun-version — the action's implicit default is floating "latest". Pin ${canonical} (${VERSION_FILE}).`,
+          `${rel}:${line}: oven-sh/setup-bun use wires no bun-version — the action's implicit default is floating "latest". Pin ${canonical} (${VERSION_FILE}).`,
         );
       }
     }
 
-    scanInstallLines({ rel, text, canonical, record, violate });
+    const variableBindingAtLine = (line) => {
+      const use = analysis.variableUses.find(
+        (candidate) => candidate.start <= line && line <= candidate.end,
+      );
+      return use !== undefined && bindingResolves(use.envBinding, use);
+    };
+    scanInstallLines({
+      rel,
+      text,
+      canonical,
+      record,
+      violate,
+      variableBindingAtLine,
+      variableScopeAtLine: (line) => {
+        const use = analysis.variableUses.find(
+          (candidate) => candidate.start <= line && line <= candidate.end,
+        );
+        return use?.job === undefined ? "" : ` in job "${use.job}"`;
+      },
+    });
+
+    for (const use of analysis.variableUses) {
+      if (use.value.includes("bun.sh/install")) continue;
+      const resolves = bindingResolves(use.envBinding, use);
+      record({
+        surface: `${kind}-shell-cache-variable`,
+        file: rel,
+        line: use.start,
+        value: use.value,
+        classification: resolves
+          ? "resolvable-expression"
+          : "unbound-expression",
+        ...(use.job === undefined ? {} : { job: use.job }),
+      });
+      if (!resolves) {
+        violate(
+          `${rel}:${use.start}: unbound shell/cache variable \${BUN_VERSION} in job "${use.job ?? "<workflow>"}" has no effective canonical BUN_VERSION declaration in workflow/job/step scope.`,
+        );
+      }
+    }
 
     // Invariant 5: a composite action's bun-version input defaults canonical.
-    if (kind === "action") {
-      const inputIdx = lines.findIndex((l) => /^ {2}bun-version:\s*$/.test(l));
-      if (inputIdx !== -1) {
-        let defaultValue = null;
-        for (let j = inputIdx + 1; j < lines.length; j++) {
-          if (/^ {2}\S/.test(lines[j])) break;
-          const def = lines[j].match(/^\s+default:\s*(.+?)\s*$/);
-          if (def) {
-            defaultValue = stripQuotes(def[1].replace(/\s+#.*$/, "").trim());
-            break;
-          }
-        }
-        record({
-          surface: "composite-default",
-          file: rel,
-          value: defaultValue,
-          classification:
-            defaultValue === canonical ? "canonical" : "divergent",
-        });
-        if (defaultValue !== canonical) {
-          violate(
-            `${rel}: composite bun-version input defaults to ${JSON.stringify(defaultValue)} — callers relying on the default silently float. Default must be the canonical ${canonical} (${VERSION_FILE}).`,
-          );
-        }
+    if (kind === "action" && analysis.compositeDefault !== null) {
+      const defaultValue = analysis.compositeDefault.raw;
+      record({
+        surface: "composite-default",
+        file: rel,
+        line: analysis.compositeDefault.line,
+        value: defaultValue,
+        classification: defaultValue === canonical ? "canonical" : "divergent",
+      });
+      if (defaultValue !== canonical) {
+        violate(
+          `${rel}: composite bun-version input defaults to ${JSON.stringify(defaultValue)} — callers relying on the default silently float. Default must be the canonical ${canonical} (${VERSION_FILE}).`,
+        );
       }
     }
   }
@@ -565,24 +863,64 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
       continue;
     }
     const text = read(rel);
+    const lines = text.split("\n");
+    const variableBindings = new Map();
     if (isDockerfile) {
-      const lines = text.split("\n");
+      let globalDefault = null;
+      let stageBinding = null;
+      let beforeFirstFrom = true;
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const arg = line.match(
-          /^\s*(?:ARG|ENV)\s+BUN_VERSION=["']?([^\s"']+)["']?/,
+          /^\s*ARG\s+BUN_VERSION(?:=["']?([^\s"']+)["']?)?\s*$/i,
         );
         if (arg) {
+          const explicit = arg[1] ?? null;
+          let effective = explicit;
+          if (beforeFirstFrom) {
+            globalDefault = explicit;
+          } else if (explicit === null) {
+            effective = globalDefault;
+            stageBinding = globalDefault;
+          } else {
+            stageBinding = explicit;
+          }
+          const classification =
+            effective === canonical
+              ? explicit === null
+                ? "resolvable-expression"
+                : "canonical"
+              : effective === null
+                ? "unbound-expression"
+                : "divergent";
           record({
             surface: "dockerfile-arg-default",
             file: rel,
             line: i + 1,
-            value: arg[1],
-            classification: arg[1] === canonical ? "canonical" : "divergent",
+            value: explicit,
+            classification,
           });
-          if (arg[1] !== canonical) {
+          if (effective !== canonical) {
             violate(
-              `${rel}:${i + 1}: BUN_VERSION defaults to ${arg[1]} — a Dockerfile runtime default must be the canonical ${canonical} (${VERSION_FILE}).`,
+              `${rel}:${i + 1}: BUN_VERSION defaults to ${effective ?? "<unbound>"} — a Dockerfile runtime ARG must have or inherit the canonical ${canonical} default (${VERSION_FILE}).`,
+            );
+          }
+        }
+        const env = line.match(
+          /^\s*ENV\s+BUN_VERSION(?:=|\s+)["']?([^\s"']+)["']?/i,
+        );
+        if (env) {
+          stageBinding = env[1];
+          record({
+            surface: "dockerfile-env-default",
+            file: rel,
+            line: i + 1,
+            value: env[1],
+            classification: env[1] === canonical ? "canonical" : "divergent",
+          });
+          if (env[1] !== canonical) {
+            violate(
+              `${rel}:${i + 1}: BUN_VERSION ENV defaults to ${env[1]} — a Dockerfile runtime environment must pin the canonical ${canonical} (${VERSION_FILE}).`,
             );
           }
         }
@@ -597,14 +935,18 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
             /^(\d+\.\d+\.\d+)(?:-[A-Za-z0-9.-]+)?$/,
           )?.[1];
           const floating = /^(canary|latest)(?:-|$)/.test(tag);
-          const ok = viaArg || tagVersion === canonical;
+          const ok = viaArg
+            ? globalDefault === canonical
+            : tagVersion === canonical;
           record({
             surface: "dockerfile-base-image",
             file: rel,
             line: i + 1,
             value: tag,
             classification: viaArg
-              ? "resolvable-expression"
+              ? ok
+                ? "resolvable-expression"
+                : "unbound-expression"
               : ok
                 ? "canonical"
                 : floating
@@ -613,31 +955,93 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
           });
           if (!ok) {
             violate(
-              `${rel}:${i + 1}: FROM oven/bun:${tag} — the base-image runtime must be the canonical ${canonical} (${VERSION_FILE}) (variant suffixes allowed) or \${BUN_VERSION} backed by a canonical default.`,
+              `${rel}:${i + 1}: FROM oven/bun:${tag} — the base-image runtime must be the canonical ${canonical} (${VERSION_FILE}) (variant suffixes allowed); interpolated \${BUN_VERSION} has no earlier canonical global ARG BUN_VERSION default.`,
             );
+          }
+        }
+        if (/^\s*FROM\s+/i.test(line)) {
+          beforeFirstFrom = false;
+          stageBinding = null;
+        }
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile shell variable syntax, not a JS template
+        if (line.includes("${BUN_VERSION}") && !arg && !env && !from) {
+          const bound = stageBinding === canonical;
+          variableBindings.set(i + 1, bound);
+          if (!line.includes("bun.sh/install")) {
+            record({
+              surface: "dockerfile-shell-cache-variable",
+              file: rel,
+              line: i + 1,
+              value: line.trim(),
+              classification: bound
+                ? "resolvable-expression"
+                : "unbound-expression",
+            });
+            if (!bound) {
+              violate(
+                `${rel}:${i + 1}: unbound shell variable \${BUN_VERSION} has no canonical BUN_VERSION ARG/ENV in this stage.`,
+              );
+            }
+          }
+        }
+      }
+    } else {
+      let shellBinding = false;
+      for (const [i, line] of lines.entries()) {
+        const def = line.match(
+          /BUN_VERSION=["']?\$\{BUN_VERSION:-([^}"']+)\}["']?/,
+        );
+        const literal = line.match(
+          /^\s*(?:export\s+|readonly\s+)?BUN_VERSION=["']?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)*)["']?(?:\s+#.*)?$/,
+        );
+        const declared = def?.[1] ?? literal?.[1];
+        if (declared !== undefined) {
+          shellBinding = declared === canonical;
+          record({
+            surface: "shell-default",
+            file: rel,
+            line: i + 1,
+            value: declared,
+            classification: shellBinding ? "canonical" : "divergent",
+          });
+          if (!shellBinding) {
+            violate(
+              `${rel}:${i + 1}: shell BUN_VERSION default ${declared} must be the canonical ${canonical} (${VERSION_FILE}).`,
+            );
+          }
+        }
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: shell variable syntax, not a JS template
+        if (line.includes("${BUN_VERSION}") && declared === undefined) {
+          variableBindings.set(i + 1, shellBinding);
+          if (!line.includes("bun.sh/install")) {
+            record({
+              surface: "shell-cache-variable",
+              file: rel,
+              line: i + 1,
+              value: line.trim(),
+              classification: shellBinding
+                ? "resolvable-expression"
+                : "unbound-expression",
+            });
+            if (!shellBinding) {
+              violate(
+                `${rel}:${i + 1}: unbound shell/cache variable \${BUN_VERSION} has no earlier canonical BUN_VERSION default.`,
+              );
+            }
           }
         }
       }
     }
-    scanInstallLines({ rel, text, canonical, record, violate });
-    if (/\.sh$/.test(rel)) {
-      for (const [i, line] of text.split("\n").entries()) {
-        const def = line.match(/BUN_VERSION="\$\{BUN_VERSION:-([^}"]+)\}"/);
-        if (!def) continue;
-        record({
-          surface: "shell-default",
-          file: rel,
-          line: i + 1,
-          value: def[1],
-          classification: def[1] === canonical ? "canonical" : "divergent",
-        });
-        if (def[1] !== canonical) {
-          violate(
-            `${rel}:${i + 1}: shell BUN_VERSION default ${def[1]} must be the canonical ${canonical} (${VERSION_FILE}).`,
-          );
-        }
-      }
-    }
+    scanInstallLines({
+      rel,
+      text,
+      canonical,
+      record,
+      violate,
+      variableBindingAtLine: (line) => variableBindings.get(line) === true,
+      variableScopeAtLine: () => "",
+      dockerfile: isDockerfile,
+    });
   }
 
   // --- Invariant 7: gate lanes wire the canonical literal directly. Missing
@@ -761,9 +1165,18 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
 // downloads (`oven-sh/bun/releases/download/bun-v<v>/…`). The GitHub
 // `releases/latest/download` convenience URL is deliberately rejected because
 // it moves without a repository change. Comment lines are prose, not installs;
-// a `${BUN_VERSION}` reference defers to the same file's validated ARG/ENV
-// default.
-function scanInstallLines({ rel, text, canonical, record, violate }) {
+// a `${BUN_VERSION}` reference is accepted only when the caller proves the
+// effective job, shell, or Docker stage binds it to the canonical default.
+function scanInstallLines({
+  rel,
+  text,
+  canonical,
+  record,
+  violate,
+  variableBindingAtLine,
+  variableScopeAtLine,
+  dockerfile = false,
+}) {
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -776,11 +1189,12 @@ function scanInstallLines({ rel, text, canonical, record, violate }) {
           /^\s*["'`]?\s*if\s+.*command\s+-v\s+bun/.test(candidate),
         );
       if (installGuard !== undefined) {
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: shell variable reference, not a JS template
+        const guardUsesVariable = installGuard.includes("${BUN_VERSION}");
         const resolvesCanonicalVersion =
           installGuard.includes("bun --version") &&
           (installGuard.includes(canonical) ||
-            // biome-ignore lint/suspicious/noTemplateCurlyInString: shell variable reference, not a JS template
-            installGuard.includes("${BUN_VERSION}"));
+            (guardUsesVariable && variableBindingAtLine(i + 1)));
         record({
           surface: "preinstalled-runtime-guard",
           file: rel,
@@ -794,21 +1208,40 @@ function scanInstallLines({ rel, text, canonical, record, violate }) {
           );
         }
       }
-      const pinned =
-        line.includes(`bun-v${canonical}`) ||
-        // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
-        line.includes("bun-v${BUN_VERSION}");
+      const pinnedLiteral = line.includes(`bun-v${canonical}`);
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: shell variable reference, not a JS template
+      const viaVariable = line.includes("bun-v${BUN_VERSION}");
+      const variableBound = viaVariable && variableBindingAtLine(i + 1);
+      const pinned = pinnedLiteral || variableBound;
       record({
         surface: "shell-install",
         file: rel,
         line: i + 1,
         value: line.trim(),
-        classification: pinned ? "canonical" : "floating",
+        classification: pinned
+          ? viaVariable
+            ? "resolvable-expression"
+            : "canonical"
+          : viaVariable
+            ? "unbound-expression"
+            : "floating",
       });
       if (!pinned) {
-        violate(
-          `${rel}:${i + 1}: bun.sh/install without the pinned release tag — a bare install or a channel argument puts a moving Bun on the host. Use \`bash -s "bun-v${canonical}"\`.`,
-        );
+        if (viaVariable) {
+          const scope = variableScopeAtLine(i + 1);
+          const reason = dockerfile
+            ? "no canonical BUN_VERSION ARG/ENV in this stage"
+            : scope.length > 0
+              ? "the effective workflow/job/step scope has no canonical BUN_VERSION declaration"
+              : "no earlier canonical BUN_VERSION default was established";
+          violate(
+            `${rel}:${i + 1}: unbound shell variable \${BUN_VERSION}${scope} — ${reason}.`,
+          );
+        } else {
+          violate(
+            `${rel}:${i + 1}: bun.sh/install without the pinned release tag — a bare install or a channel argument puts a moving Bun on the host. Use \`bash -s "bun-v${canonical}"\`.`,
+          );
+        }
       }
     }
     if (/oven-sh\/bun\/releases\/latest\/download\//.test(line)) {

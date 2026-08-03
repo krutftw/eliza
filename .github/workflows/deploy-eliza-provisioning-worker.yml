@@ -232,9 +232,10 @@ jobs:
               grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
             fi
 
-            # bunx symlink: the canary `bun.sh/install` tarball stopped shipping
-            # bunx as a separate binary at some point; build scripts that call
-            # `bunx tsc` etc. then fail with `bun: command not found: bunx`.
+            # bunx symlink: hosts provisioned in the canary era got a tarball
+            # that stopped shipping bunx as a separate binary; build scripts
+            # that call `bunx tsc` etc. then fail with `bun: command not found:
+            # bunx`. Kept as a defensive shim for those existing hosts.
             # `bunx` is just `bun` reading argv[0] — a symlink is sufficient.
             if [ ! -e /home/deploy/.bun/bin/bunx ] && [ -e /home/deploy/.bun/bin/bun ]; then
               echo "[host-prereqs] creating bunx symlink"
@@ -326,9 +327,9 @@ jobs:
             # are still running, so generator failure cannot cause downtime.
             bash packages/scripts/cloud/admin/ensure-generated-keywords.sh
 
-            # Install the canary (Rust) Bun on first install.
+            # Install the canonical pinned Bun on first install.
             if ! command -v bun >/dev/null 2>&1; then
-              curl -fsSL https://bun.sh/install | bash -s "canary"
+              curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" # pinned: canonical CI Bun (.github/ci-bun-version.json)
               export BUN_INSTALL="$HOME/.bun"
               export PATH="$BUN_INSTALL/bin:$PATH"
             fi

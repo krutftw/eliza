@@ -57,7 +57,7 @@ permissions:
 
 env:
   NODE_VERSION: "24"
-  BUN_VERSION: "canary"
+  BUN_VERSION: "1.3.14" # pinned: canonical CI Bun (.github/ci-bun-version.json); floating canary/latest breaks --frozen-lockfile (#11184/#9454)
   # Published Kokoro bundle — the #9588-fixed F16 republish (2026-07-02).
   # The former `kokoro-82m-v1_0-Q4_K_M.gguf` filename 404s on the repo; the
   # canonical F16 name below is what discovery falls through to and what the

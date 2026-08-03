@@ -61,7 +61,7 @@ jobs:
       matrix:
         # Exercise the same Bun line that can parse the current lockfile, so
         # Windows smoke covers repo behavior instead of failing during install.
-        bun-version: ["canary"]
+        bun-version: ["1.3.14"] # pinned: canonical CI Bun (.github/ci-bun-version.json); floating canary/latest breaks --frozen-lockfile (#11184/#9454)
 
     steps:
       - name: Enable long paths (Windows)

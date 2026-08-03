@@ -37,7 +37,7 @@ echo "  ✓ uv: $(uv --version)"
 # Check Bun
 if ! command -v bun &>/dev/null; then
     echo "  ⚠ Bun not found. Installing..."
-    curl -fsSL https://bun.sh/install | bash
+    curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" # pinned: canonical CI Bun (.github/ci-bun-version.json)
     export PATH="$HOME/.bun/bin:$PATH"
 fi
 echo "  ✓ Bun: $(bun --version)"

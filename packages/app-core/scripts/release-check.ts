@@ -23,6 +23,16 @@ const requiredPaths = [
   "packages/app-core/scripts/setup-upstreams.mjs",
   "packages/app-core/scripts/init-submodules.mjs",
 ];
+
+// The release workflows must wire the canonical pinned Bun; deriving the
+// expected snippet from the source of truth keeps this checker from going
+// stale on a version bump (packages/scripts/ci-bun-version-contract.mjs
+// enforces the workflows themselves).
+const canonicalBunVersion = (
+  JSON.parse(
+    readFileSync(".github/ci-bun-version.json", "utf8"),
+  ) as { version: string }
+).version;
 const forbiddenPrefixes = ["dist/Eliza.app/"];
 const orchestratorBrokenLifecycleTarget = "./scripts/ensure-node-pty.mjs";
 const orchestratorPluginPackageJsonPathCandidates = [
@@ -83,7 +93,7 @@ function resolveOrchestratorPluginPackageJsonPath() {
   return resolveExistingPath(orchestratorPluginPackageJsonPathCandidates);
 }
 const requiredWorkflowSnippets = [
-  'BUN_VERSION: "canary"',
+  `BUN_VERSION: "${canonicalBunVersion}"`,
   "workflow_call:",
   "name: Validate Release Inputs",
   "Manual branch dispatches must provide inputs.tag; refusing to derive a release tag from package.json.",
@@ -263,7 +273,7 @@ const requiredElectrobunPrWorkflowSnippets = [
   "workflow_dispatch:",
   "permissions:",
   "contents: read",
-  'BUN_VERSION: "canary"',
+  `BUN_VERSION: "${canonicalBunVersion}"`,
   "name: Release Workflow Contract",
   "bun install --ignore-scripts",
   'run-postinstall: "true"',

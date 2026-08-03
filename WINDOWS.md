@@ -13,11 +13,11 @@ helper under `packages/scripts/`), don't paper over it in CI.
 
 1. **Windows 10/11**, 64-bit.
 2. **Node.js 24.15.0** (pinned in root `package.json` `engines.node`).
-3. **Bun ≥ 1.3.14** (1.4+ recommended). Older bun versions can't parse the
-   v2 lockfile this repo ships; bun gracefully falls back to a v1 lockfile
-   on `bun install` from 1.3.14+, so 1.3.x stable works in practice (the v2
-   parser is in 1.4+). Install with `irm bun.sh/install.ps1 | iex` or via
-   WinGet (`winget install Oven-sh.Bun`). Upgrade with `bun upgrade`. Note
+3. **Bun 1.3.14** — the canonical repository runtime, pinned in
+   `.github/ci-bun-version.json` and root `packageManager` (the committed
+   `bun.lock` is lockfileVersion 1, which floating/newer channels can
+   reserialize — stay on the pin). Install with `irm bun.sh/install.ps1 | iex`
+   or via WinGet (`winget install Oven-sh.Bun`). Note
    that `bun upgrade --canary` fails with `Failed to rename current
    executable AccessDenied` on Windows when bun is running; close all
    terminals using bun first.

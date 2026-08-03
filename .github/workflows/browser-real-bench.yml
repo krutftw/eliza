@@ -57,12 +57,11 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
 
       # setup-bun-workspace instead of a hand-rolled `bun install
-      # --frozen-lockfile`: this repo tracks bun canary, and canary rebuilds
-      # reserialize bun.lock between builds, so a bare frozen install reds with
-      # "lockfile had changes, but lockfile is frozen" on schedule runs (e.g.
-      # run 28513244717). The composite handles the drift fallback and restores
-      # the committed lockfile; same invocation as scenario-pr.yml's
-      # app-browser-core lane this workflow mirrors.
+      # --frozen-lockfile`: a Bun version change can reserialize bun.lock and
+      # red a bare frozen install with "lockfile had changes, but lockfile is
+      # frozen" (e.g. run 28513244717). The composite handles the drift
+      # fallback and restores the committed lockfile; same invocation as
+      # scenario-pr.yml's app-browser-core lane this workflow mirrors.
       - name: Setup workspace dependencies
         uses: ./.github/actions/setup-bun-workspace
         with:

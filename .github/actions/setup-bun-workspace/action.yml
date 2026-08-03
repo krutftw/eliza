@@ -357,7 +357,7 @@ runs:
               # gates (cloud-gateway-*, cache-key-stability) still catch genuine
               # drift.
               if ! git diff --quiet -- bun.lock; then
-                echo "::warning::bun.lock changed during install (bun-canary reserialization); restoring the committed lockfile."
+                echo "::warning::bun.lock changed during install (Bun-version reserialization); restoring the committed lockfile."
                 git checkout -- bun.lock
               fi
               rm -f "$install_log"

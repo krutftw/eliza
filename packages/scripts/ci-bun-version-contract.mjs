@@ -14,21 +14,25 @@
  * literal is repeated at each site and this contract is what guarantees the
  * copies never drift from the source of truth.
  *
- * Checked statically against the checked-in tree (no workflow is executed):
+ * Checked statically against the tracked tree (git ls-files when the root is a
+ * git checkout, so populated submodules and untracked build output cannot
+ * change the result; a plain directory walk only for synthetic fixture trees):
  *
- *   1. Every `bun-version:`/`BUN_VERSION:` value in workflows and composite
- *      actions is the canonical pin, a resolvable expression whose declaration
- *      in the same file is canonical, or an explicitly allowlisted floating
- *      cell. Concrete divergence, floating values, unbound expressions, and
- *      unparseable syntax all fail.
+ *   1. Every `bun-version:`/`BUN_VERSION:` value in workflows, composite
+ *      actions, and workflow-shaped templates outside `.github` is the
+ *      canonical pin, an expression that RESOLVES to a validated same-file
+ *      declaration, or an explicitly allowlisted floating cell. Concrete
+ *      divergence, floating values, expressions with no backing declaration,
+ *      and unparseable syntax all fail.
  *   2. Every `oven-sh/setup-bun` use is pinned to a reviewed commit SHA and
  *      wires an explicit `bun-version` — the action's implicit default is
  *      `latest`, so an absent key is a floating runtime.
- *   3. Every `bun.sh/install` shell install pins `bun-v<canonical>` — a bare
- *      `| bash` or a channel argument installs a moving runtime on deploy
- *      hosts.
- *   4. Every `packageManager` declaring Bun (root, Feed, generated-project
- *      template, and anything added later) equals `bun@<canonical>`, and the
+ *   3. Every `bun.sh/install` shell install and every
+ *      `oven-sh/bun/releases/download/bun-v…` artifact URL in Dockerfiles,
+ *      shell scripts, cloud-init templates, and .mjs installers pins the
+ *      canonical version; Dockerfile `ARG/ENV BUN_VERSION` defaults and
+ *      `FROM oven/bun:<tag>` base images must be canonical.
+ *   4. Every `packageManager` declaring Bun equals `bun@<canonical>`, and the
  *      root `@types/bun`/`bun-types` anchors equal the canonical version
  *      exactly. Non-root workspace type declarations are classified in the
  *      inventory (exact-canonical / compatible-range / drift / unparseable)
@@ -37,17 +41,24 @@
  *   5. A composite action declaring a `bun-version` input must default it to
  *      the canonical pin, since callers relying on the default otherwise
  *      float silently — the previous `canary` default covered 112 call sites.
- *   6. Deterministic gate and deploy workflows (GATE_WORKFLOWS) additionally
+ *   6. A FLOATING_ALLOWLIST entry is additive-only: it needs a non-empty
+ *      reason AND a canonical lane in the same file, so a sanctioned canary
+ *      cell can only ever run in addition to the pinned runtime, never as
+ *      the default or sole one.
+ *   7. Deterministic gate and deploy workflows (GATE_WORKFLOWS) additionally
  *      must wire the canonical literal directly, so required checks never
  *      depend on indirection to become reproducible.
  *
  * The full scan is returned (and writable via --inventory) as a
- * machine-readable inventory of every resolution site and its classification.
- * Embedded platform Bun binaries (Android/RISC-V artifacts) are a separate
- * shipping boundary and are deliberately not scanned here.
+ * machine-readable inventory of every resolution site and its classification,
+ * including the deliberately excluded surfaces. Embedded platform Bun builds
+ * (the Android staging pipeline and the RISC-V custom build) are a separate,
+ * device-proven shipping boundary: they are inventoried as excluded, never
+ * version-checked here.
  */
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_REPO_ROOT = resolve(
@@ -69,10 +80,40 @@ const REVIEWED_SETUP_BUN_SHAS = new Set([
 
 // Non-authoritative floating cells, e.g. an upstream Bun compatibility matrix
 // that runs IN ADDITION to the pinned lane. Each entry scopes one file plus
-// the exact floating value it may wire, with a reason. Empty by design: no
-// workflow currently has a sanctioned reason to float, and an entry added
-// here is a reviewable diff rather than silent drift.
+// the exact floating value it may wire, and must carry a non-empty reason;
+// the file must also wire the canonical pin somewhere (additive-only — a
+// canary can never be a file's sole runtime). Empty by design: no surface
+// currently has a sanctioned reason to float, and an entry added here is a
+// reviewable diff rather than silent drift.
 const FLOATING_ALLOWLIST = [];
+
+// Deliberately excluded surfaces, inventoried so the exclusion is visible
+// rather than silent. The embedded entries are the Android/RISC-V Bun binary
+// shipping boundary #17044 scopes out (their versions are proven on-device,
+// not by text equality); the advisory entry is developer-machine guidance,
+// not a repository runtime selector.
+const EXCLUDED_SURFACES = [
+  {
+    prefix: "packages/app-core/scripts/bun-riscv64/",
+    classification: "embedded-boundary-excluded",
+    reason: "custom RISC-V Bun build with its own device-proof record",
+  },
+  {
+    prefix: "packages/app-core/scripts/lib/stage-android-agent.mjs",
+    classification: "embedded-boundary-excluded",
+    reason: "Android embedded Bun staging; channel-driven, device-proven",
+  },
+  {
+    prefix: "packages/app-core/src/cli/doctor/checks.ts",
+    classification: "advisory-excluded",
+    reason: "doctor fix hint for the developer's machine, not a repo runtime",
+  },
+  {
+    prefix: "packages/scripts/ci-bun-version-contract.mjs",
+    classification: "contract-self-excluded",
+    reason: "this contract's own policy text names the install idiom",
+  },
+];
 
 // Required, scheduled, and deploy-critical install lanes that must wire the
 // concrete pin directly (not merely resolve through indirection). The required
@@ -95,8 +136,8 @@ const GATE_WORKFLOWS = [
 const CONCRETE_PIN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)*$/;
 const FLOATING = new Set(["canary", "latest"]);
 
-// Directories that never contain first-party manifests; skipping them keeps
-// the package.json walk fast and out of vendored trees.
+// Fixture-tree walk only (real repos are enumerated via git ls-files);
+// skipping dependency/build dirs keeps synthetic trees cheap to scan.
 const WALK_SKIP = new Set([
   "node_modules",
   ".git",
@@ -120,10 +161,12 @@ function stripQuotes(raw) {
 }
 
 // Extract every `bun-version:`/`BUN_VERSION:` value wired in a YAML file as
-// `{ key, raw, line }`, with inline comments and quotes stripped. Handles the
-// scalar form, the flow list (`bun-version: ["1.3.14"]`, matrix cells), and
-// the block list (`bun-version:` followed by `- value` items). Only real YAML
-// key wiring counts — a version named in a `#` comment is never a pin.
+// `{ key, raw, line, origin }`, with inline comments and quotes stripped.
+// Handles the scalar form, the flow list (`bun-version: ["1.3.14"]`, matrix
+// cells), and the block list (`bun-version:` followed by `- value` items);
+// `origin` distinguishes list cells (matrix declarations) from scalar wiring
+// so expression resolution can demand the right declaration shape. Only real
+// YAML key wiring counts — a version named in a `#` comment is never a pin.
 export function bunVersionValues(text) {
   const out = [];
   const lines = text.split("\n");
@@ -143,6 +186,7 @@ export function bunVersionValues(text) {
           key,
           raw: stripQuotes(item[2].replace(/\s+#.*$/, "").trim()),
           line: j + 1,
+          origin: "block-list",
         });
       }
       continue;
@@ -152,11 +196,12 @@ export function bunVersionValues(text) {
       const inner = raw.replace(/^\[/, "").replace(/\]$/, "");
       for (const cell of inner.split(",")) {
         const value = stripQuotes(cell.trim());
-        if (value) out.push({ key, raw: value, line: i + 1 });
+        if (value)
+          out.push({ key, raw: value, line: i + 1, origin: "flow-list" });
       }
       continue;
     }
-    out.push({ key, raw: stripQuotes(raw), line: i + 1 });
+    out.push({ key, raw: stripQuotes(raw), line: i + 1, origin: "scalar" });
   }
   return out;
 }
@@ -165,22 +210,9 @@ function isExpression(raw) {
   return raw.includes("${{");
 }
 
-// Expressions that resolve within the same file: `${{ env.BUN_VERSION }}`
-// resolves against the file's own BUN_VERSION declaration and
-// `${{ matrix.bun-version }}` against its matrix cells — both of which this
-// contract validates independently, so the indirection cannot hide a float.
-// Inside composite actions, `${{ inputs.bun-version }}` resolves against the
-// input default validated by the composite rule. Anything else is unbound.
-const RESOLVABLE_EXPRESSIONS = {
-  workflow: [
-    /^\$\{\{\s*env\.BUN_VERSION\s*\}\}$/,
-    /^\$\{\{\s*matrix\.bun-version\s*\}\}$/,
-  ],
-  action: [
-    /^\$\{\{\s*inputs\.bun-version\s*\}\}$/,
-    /^\$\{\{\s*steps\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_-]+\s*\}\}$/,
-  ],
-};
+const ENV_EXPRESSION = /^\$\{\{\s*env\.BUN_VERSION\s*\}\}$/;
+const MATRIX_EXPRESSION = /^\$\{\{\s*matrix\.bun-version\s*\}\}$/;
+const INPUTS_EXPRESSION = /^\$\{\{\s*inputs\.bun-version\s*\}\}$/;
 
 function isAllowlisted(allowlist, file, value) {
   return allowlist.some(
@@ -220,41 +252,48 @@ export function classifyTypeRange(range, canonical) {
   return "unparseable";
 }
 
-function walkPackageJsons(root) {
+// Tracked-file enumeration. A real checkout is read through git so the scan
+// matches the checked-in tree exactly; the recursive walk exists only for the
+// synthetic fixture trees the tests build (no `.git` there, by construction).
+function trackedFiles(repoRoot) {
+  if (existsSync(join(repoRoot, ".git"))) {
+    const output = execFileSync("git", ["-C", repoRoot, "ls-files", "-z"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return output.split("\0").filter((entry) => entry.length > 0);
+  }
   const found = [];
-  const stack = [root];
+  const stack = [repoRoot];
   while (stack.length > 0) {
     const dir = stack.pop();
-    let entries;
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
       if (entry.isDirectory()) {
         if (!WALK_SKIP.has(entry.name)) stack.push(join(dir, entry.name));
-      } else if (entry.name === "package.json") {
-        found.push(join(dir, entry.name));
+      } else {
+        found.push(
+          join(dir, entry.name)
+            .slice(repoRoot.length + 1)
+            .split(sep)
+            .join("/"),
+        );
       }
     }
   }
   return found.sort();
 }
 
-function tryRead(path) {
-  try {
-    return readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
+function excludedSurface(rel) {
+  return EXCLUDED_SURFACES.find((entry) => rel.startsWith(entry.prefix));
 }
 
 // Validate every invariant against a repo layout rooted at `repoRoot`. Pure
 // (no process exit / no console) so tests can drive it against fixture trees.
 // Collects every violation before throwing one aggregate error, so a version
 // bump sees the complete list of stale sites in a single run. Returns the
-// canonical version and the full classified inventory on success.
+// canonical version and the full classified inventory on success. Read and
+// parse failures on tracked files are deliberately NOT caught: a surface that
+// cannot be inspected must fail the contract, not vanish from the inventory.
 export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
   const allowlist = overrides.floatingAllowlist ?? FLOATING_ALLOWLIST;
   const reviewedShas =
@@ -277,68 +316,110 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
   const record = (site) => inventory.push(site);
   const violate = (message) => violations.push(message);
 
-  // --- YAML surfaces: workflows and composite actions. ---
-  const yamlFiles = [];
-  try {
-    for (const name of readdirSync(resolve(repoRoot, WORKFLOW_DIR))) {
-      if (name.endsWith(".yml") || name.endsWith(".yaml")) {
-        yamlFiles.push({ rel: join(WORKFLOW_DIR, name), kind: "workflow" });
-      }
+  for (const entry of allowlist) {
+    if (typeof entry.reason !== "string" || entry.reason.trim().length === 0) {
+      violate(
+        `FLOATING_ALLOWLIST entry for ${entry.file ?? "<missing file>"} has no reason — a sanctioned floating cell must say why it exists.`,
+      );
     }
-  } catch {
-    // Fixture trees without workflows still exercise the manifest rules.
-  }
-  try {
-    for (const name of readdirSync(resolve(repoRoot, ACTIONS_DIR))) {
-      for (const candidate of ["action.yml", "action.yaml"]) {
-        const rel = join(ACTIONS_DIR, name, candidate);
-        try {
-          statSync(resolve(repoRoot, rel));
-          yamlFiles.push({ rel, kind: "action" });
-        } catch {
-          // Only one of the two spellings exists per action.
-        }
-      }
-    }
-  } catch {
-    // No composite actions in this tree.
   }
 
-  for (const { rel, kind } of yamlFiles) {
-    const text = read(rel);
+  const tracked = trackedFiles(repoRoot);
+
+  // --- YAML surfaces: workflows, composite actions, and workflow-shaped
+  // templates outside .github (project/plugin CI templates are authoritative
+  // runtime declarations for whoever instantiates them). ---
+  const yamlFiles = [];
+  for (const rel of tracked) {
+    if (rel.startsWith(`${WORKFLOW_DIR}/`) && /\.ya?ml$/.test(rel)) {
+      yamlFiles.push({ rel, kind: "workflow" });
+    } else if (
+      rel.startsWith(`${ACTIONS_DIR}/`) &&
+      /\/action\.ya?ml$/.test(rel)
+    ) {
+      yamlFiles.push({ rel, kind: "action" });
+    } else if (
+      !rel.startsWith(".github/") &&
+      /\.ya?ml$/.test(rel) &&
+      !excludedSurface(rel)
+    ) {
+      const text = read(rel);
+      if (/^\s*(?:-\s+)?(bun-version|BUN_VERSION):/m.test(text)) {
+        yamlFiles.push({ rel, kind: "workflow", text });
+      }
+    }
+  }
+
+  for (const { rel, kind, text: preread } of yamlFiles) {
+    const text = preread ?? read(rel);
     const lines = text.split("\n");
+    const values = bunVersionValues(text);
+    const hasEnvDeclaration = values.some(
+      (v) => v.key === "BUN_VERSION" && !isExpression(v.raw),
+    );
+    const hasMatrixCells = values.some(
+      (v) => v.origin !== "scalar" && !isExpression(v.raw),
+    );
+    const hasCanonicalConcrete = values.some((v) => v.raw === canonical);
 
     // Invariant 1: every wired value is canonical, resolvable, or allowlisted.
-    for (const { key, raw, line } of bunVersionValues(text)) {
+    for (const { key, raw, line, origin } of values) {
       const site = {
         surface: `${kind}-version`,
         file: rel,
         line,
         key,
+        origin,
         value: raw,
       };
       if (isExpression(raw)) {
-        const ok = RESOLVABLE_EXPRESSIONS[kind].some((re) => re.test(raw));
+        // An expression only counts as resolvable when the declaration it
+        // reads actually exists in this file — the declaration itself is
+        // validated by this same loop, so the indirection cannot hide a
+        // float. Composite inputs resolve against the input default checked
+        // by the composite rule below. Anything else (step outputs, unknown
+        // contexts, cross-file env) cannot be proven pinned statically.
+        let resolvable = false;
+        let missing = "";
+        if (ENV_EXPRESSION.test(raw)) {
+          resolvable = hasEnvDeclaration;
+          missing = "no BUN_VERSION declaration in this file";
+        } else if (MATRIX_EXPRESSION.test(raw)) {
+          resolvable = hasMatrixCells;
+          missing = "no bun-version matrix cells in this file";
+        } else if (kind === "action" && INPUTS_EXPRESSION.test(raw)) {
+          resolvable = /^ {2}bun-version:\s*$/m.test(text);
+          missing = "no bun-version input declared in this action";
+        } else {
+          missing =
+            "only same-file env.BUN_VERSION / matrix.bun-version / composite inputs.bun-version indirection is checkable";
+        }
         record({
           ...site,
-          classification: ok ? "resolvable-expression" : "unbound-expression",
+          classification: resolvable
+            ? "resolvable-expression"
+            : "unbound-expression",
         });
-        if (!ok) {
+        if (!resolvable) {
           violate(
-            `${rel}:${line}: wires Bun via unbound expression ${raw} — only same-file env.BUN_VERSION / matrix.bun-version indirection is checkable, so this cannot be proven pinned.`,
+            `${rel}:${line}: wires Bun via unbound expression ${raw} — ${missing}, so this cannot be proven pinned.`,
           );
         }
         continue;
       }
       if (FLOATING.has(raw)) {
-        const ok = isAllowlisted(allowlist, rel, raw);
+        const sanctioned = isAllowlisted(allowlist, rel, raw);
         record({
           ...site,
-          classification: ok ? "allowlisted-floating" : "floating",
+          classification: sanctioned ? "allowlisted-floating" : "floating",
         });
-        if (!ok) {
+        if (!sanctioned) {
           violate(
             `${rel}:${line}: wires floating Bun "${raw}". Every authoritative lane must stay pinned to ${canonical} (${VERSION_FILE}); a deliberate extra compatibility cell needs a FLOATING_ALLOWLIST entry.`,
+          );
+        } else if (!hasCanonicalConcrete) {
+          violate(
+            `${rel}:${line}: allowlisted floating "${raw}" is this file's ONLY runtime — an allowlisted cell must run in addition to the canonical ${canonical} lane, never as the default or sole runtime (#17044).`,
           );
         }
         continue;
@@ -422,24 +503,7 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
       }
     }
 
-    // Invariant 3: shell installs pin the canonical release tag.
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].includes("bun.sh/install")) continue;
-      if (/^\s*#/.test(lines[i])) continue;
-      const pinned = lines[i].includes(`bun-v${canonical}`);
-      record({
-        surface: "shell-install",
-        file: rel,
-        line: i + 1,
-        value: lines[i].trim(),
-        classification: pinned ? "canonical" : "floating",
-      });
-      if (!pinned) {
-        violate(
-          `${rel}:${i + 1}: bun.sh/install without the pinned release tag — a bare install or a channel argument puts a moving Bun on the host. Use \`bash -s "bun-v${canonical}"\`.`,
-        );
-      }
-    }
+    scanInstallLines({ rel, text, canonical, record, violate });
 
     // Invariant 5: a composite action's bun-version input defaults canonical.
     if (kind === "action") {
@@ -470,11 +534,106 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
     }
   }
 
-  // --- Invariant 6: gate lanes wire the canonical literal directly. ---
+  // --- Invariant 3, non-Action installers: Dockerfiles, shell scripts,
+  // cloud-init templates, and .mjs bootstrap installers. ---
+  for (const rel of tracked) {
+    const name = basename(rel);
+    const isDockerfile = name.startsWith("Dockerfile");
+    const isShellLike = /\.(sh|tftpl|mjs)$/.test(rel);
+    if (!isDockerfile && !isShellLike) continue;
+    const excluded = excludedSurface(rel);
+    if (excluded) {
+      record({
+        surface: "installer",
+        file: rel,
+        value: null,
+        classification: excluded.classification,
+        reason: excluded.reason,
+      });
+      continue;
+    }
+    const text = read(rel);
+    if (isDockerfile) {
+      const lines = text.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const arg = line.match(
+          /^\s*(?:ARG|ENV)\s+BUN_VERSION=["']?([^\s"']+)["']?/,
+        );
+        if (arg) {
+          record({
+            surface: "dockerfile-arg-default",
+            file: rel,
+            line: i + 1,
+            value: arg[1],
+            classification: arg[1] === canonical ? "canonical" : "divergent",
+          });
+          if (arg[1] !== canonical) {
+            violate(
+              `${rel}:${i + 1}: BUN_VERSION defaults to ${arg[1]} — a Dockerfile runtime default must be the canonical ${canonical} (${VERSION_FILE}).`,
+            );
+          }
+        }
+        const from = line.match(/^\s*FROM\s+oven\/bun:([^\s]+)/i);
+        if (from) {
+          const tag = from[1];
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
+          const viaArg = tag.includes("${BUN_VERSION}");
+          // Image tags carry distro variants (1.3.14-alpine, 1.3.14-debian);
+          // the version prefix is what must match the canonical pin.
+          const tagVersion = tag.match(
+            /^(\d+\.\d+\.\d+)(?:-[A-Za-z0-9.-]+)?$/,
+          )?.[1];
+          const floating = /^(canary|latest)(?:-|$)/.test(tag);
+          const ok = viaArg || tagVersion === canonical;
+          record({
+            surface: "dockerfile-base-image",
+            file: rel,
+            line: i + 1,
+            value: tag,
+            classification: viaArg
+              ? "resolvable-expression"
+              : ok
+                ? "canonical"
+                : floating
+                  ? "floating"
+                  : "divergent",
+          });
+          if (!ok) {
+            violate(
+              `${rel}:${i + 1}: FROM oven/bun:${tag} — the base-image runtime must be the canonical ${canonical} (${VERSION_FILE}) (variant suffixes allowed) or \${BUN_VERSION} backed by a canonical default.`,
+            );
+          }
+        }
+      }
+    }
+    scanInstallLines({ rel, text, canonical, record, violate });
+    if (/\.sh$/.test(rel)) {
+      for (const [i, line] of text.split("\n").entries()) {
+        const def = line.match(/BUN_VERSION="\$\{BUN_VERSION:-([^}"]+)\}"/);
+        if (!def) continue;
+        record({
+          surface: "shell-default",
+          file: rel,
+          line: i + 1,
+          value: def[1],
+          classification: def[1] === canonical ? "canonical" : "divergent",
+        });
+        if (def[1] !== canonical) {
+          violate(
+            `${rel}:${i + 1}: shell BUN_VERSION default ${def[1]} must be the canonical ${canonical} (${VERSION_FILE}).`,
+          );
+        }
+      }
+    }
+  }
+
+  // --- Invariant 7: gate lanes wire the canonical literal directly. Missing
+  // gate files throw via the uncaught read — a required lane that vanished is
+  // a contract failure, not a skip. Fixture trees create every gate. ---
   for (const name of GATE_WORKFLOWS) {
     const rel = join(WORKFLOW_DIR, name);
-    const text = tryRead(resolve(repoRoot, rel));
-    if (text === null) continue;
+    const text = read(rel);
     const values = bunVersionValues(text);
     const floats = values.find(
       (v) => !isExpression(v.raw) && FLOATING.has(v.raw),
@@ -491,16 +650,19 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
     }
   }
 
-  // --- Invariant 4: manifests and type anchors. ---
-  const rootPackagePath = resolve(repoRoot, "package.json");
-  const rootPackageText = tryRead(rootPackagePath);
-  for (const path of walkPackageJsons(repoRoot)) {
-    const rel = relative(repoRoot, path).split(sep).join("/");
+  // --- Invariant 4: manifests and type anchors. A tracked package.json that
+  // fails to parse throws: a surface that cannot be inspected must fail the
+  // contract rather than silently vanish from the inventory. ---
+  for (const rel of tracked) {
+    if (basename(rel) !== "package.json") continue;
     let parsed;
     try {
-      parsed = JSON.parse(readFileSync(path, "utf8"));
-    } catch {
-      continue; // Malformed manifests are some other gate's problem.
+      parsed = JSON.parse(read(rel));
+    } catch (error) {
+      throw new Error(
+        `${rel}: tracked manifest failed to parse — cannot verify its Bun surfaces (${error.message})`,
+        { cause: error },
+      );
     }
     const pm = parsed.packageManager;
     if (typeof pm === "string" && pm.startsWith("bun@")) {
@@ -517,7 +679,7 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
         );
       }
     }
-    const isRoot = resolve(path) === rootPackagePath;
+    const isRoot = rel === "package.json";
     for (const depField of ["dependencies", "devDependencies"]) {
       for (const dep of ["@types/bun", "bun-types"]) {
         const range = parsed[depField]?.[dep];
@@ -541,11 +703,6 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
       }
     }
   }
-  if (rootPackageText === null && overrides.requireRootPackage) {
-    violate(
-      `package.json: missing — cannot verify the packageManager surface.`,
-    );
-  }
 
   if (violations.length > 0) {
     throw new Error(
@@ -563,6 +720,54 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
     ),
     gateWorkflows: GATE_WORKFLOWS,
   };
+}
+
+// Shared line scan for the two install idioms that appear outside Action
+// YAML keys: `curl … bun.sh/install | bash …` and direct release-artifact
+// downloads (`oven-sh/bun/releases/download/bun-v<v>/…`). Comment lines are
+// prose, not installs; a `${BUN_VERSION}` reference defers to the same file's
+// validated ARG/ENV default.
+function scanInstallLines({ rel, text, canonical, record, violate }) {
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*#/.test(line)) continue;
+    if (line.includes("bun.sh/install")) {
+      const pinned =
+        line.includes(`bun-v${canonical}`) ||
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
+        line.includes("bun-v${BUN_VERSION}");
+      record({
+        surface: "shell-install",
+        file: rel,
+        line: i + 1,
+        value: line.trim(),
+        classification: pinned ? "canonical" : "floating",
+      });
+      if (!pinned) {
+        violate(
+          `${rel}:${i + 1}: bun.sh/install without the pinned release tag — a bare install or a channel argument puts a moving Bun on the host. Use \`bash -s "bun-v${canonical}"\`.`,
+        );
+      }
+    }
+    const download = line.match(
+      /oven-sh\/bun\/releases\/download\/bun-v(\d+\.\d+\.\d+)/,
+    );
+    if (download) {
+      record({
+        surface: "release-download",
+        file: rel,
+        line: i + 1,
+        value: download[1],
+        classification: download[1] === canonical ? "canonical" : "divergent",
+      });
+      if (download[1] !== canonical) {
+        violate(
+          `${rel}:${i + 1}: downloads Bun release bun-v${download[1]} — must be the canonical ${canonical} (${VERSION_FILE}).`,
+        );
+      }
+    }
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

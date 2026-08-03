@@ -1,11 +1,17 @@
-// Pins the Bun runtime contract (#13402, #17044) against synthetic repo trees:
-// a clean tree passes (with `canary` named only in a comment ignored), while
-// each failure mode the contract exists to catch is exercised red — divergent
-// concrete pin, floating literal/env/matrix cell, mutable action tag, implicit
-// setup-bun, unbound expression, unpinned bun.sh/install, drifting
-// packageManager, drifting root type anchor, and a floating composite-action
-// default. Also runs the shipped contract against the real repo so the guard
-// stays true as workflows change. Deterministic — no workflow runs.
+/**
+ * Pins the Bun runtime contract (#13402, #17044) against synthetic repo trees
+ * and the real checkout. A clean tree passes (with `canary` named only in a
+ * comment ignored), and each failure mode the contract exists to catch is
+ * exercised red: divergent concrete pin, floating literal/env/matrix cell,
+ * mutable action tag, implicit setup-bun, expressions whose backing
+ * declaration is missing (env, matrix, and composite step-output forms),
+ * unpinned bun.sh/install, Dockerfile ARG/FROM drift, divergent release
+ * downloads, drifting packageManager and root type anchors, floating
+ * composite-action defaults, allowlist entries that lack a reason or a
+ * canonical sibling lane, a malformed tracked manifest, and a missing gate
+ * workflow (fail-fast, not skip). Deterministic — no workflow runs, no
+ * network.
+ */
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,8 +29,10 @@ interface InventorySite {
   file: string;
   line?: number;
   key?: string;
+  origin?: string;
   value: string | null;
   classification: string;
+  reason?: string;
 }
 
 const CANONICAL = "1.3.14";
@@ -101,7 +109,7 @@ function buildRepo({
   files = {},
 }: {
   version?: string;
-  overrides?: Record<string, string>;
+  overrides?: Record<string, string | null>;
   extra?: Record<string, string>;
   files?: Record<string, string>;
 }): string {
@@ -112,6 +120,9 @@ function buildRepo({
     JSON.stringify({ version }),
   );
   for (const name of GATE_WORKFLOWS) {
+    // `null` deletes a gate: the contract must fail loudly on a missing
+    // required lane rather than skip it.
+    if (overrides[name] === null) continue;
     writeFileSync(
       join(root, ".github", "workflows", name),
       overrides[name] ?? gateStub(),
@@ -128,9 +139,24 @@ function buildRepo({
   return root;
 }
 
-function expectViolation(root: string, pattern: RegExp) {
+function expectViolation(
+  root: string,
+  pattern: RegExp,
+  overrides?: Record<string, unknown>,
+) {
   try {
-    expect(() => runContract(root)).toThrow(pattern);
+    expect(() => runContract(root, overrides)).toThrow(pattern);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function inventoryOf(
+  root: string,
+  overrides?: Record<string, unknown>,
+): InventorySite[] {
+  try {
+    return runContract(root, overrides).inventory;
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -167,6 +193,10 @@ describe("ci-bun-version-contract", () => {
       buildRepo({ overrides: { "ci.yaml": GATE_NO_PIN } }),
       /does not wire the canonical Bun pin/,
     );
+  });
+
+  test("fails loudly when a gate workflow is missing, instead of skipping", () => {
+    expectViolation(buildRepo({ overrides: { "ci.yaml": null } }), /ci\.yaml/);
   });
 
   test("fails when the source of truth itself floats", () => {
@@ -242,7 +272,41 @@ jobs:
     );
   });
 
-  test("fails an unbound expression that cannot be proven pinned", () => {
+  test("fails an env expression whose BUN_VERSION declaration is missing", () => {
+    const unbacked = `name: Lane
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: \${{ env.BUN_VERSION }}
+`;
+    expectViolation(
+      buildRepo({ extra: { "unbacked-env.yml": unbacked } }),
+      /unbound expression.*no BUN_VERSION declaration/,
+    );
+  });
+
+  test("fails a matrix expression with no bun-version cells to resolve", () => {
+    const unbacked = `name: Lane
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: \${{ matrix.bun-version }}
+`;
+    expectViolation(
+      buildRepo({ extra: { "unbacked-matrix.yml": unbacked } }),
+      /unbound expression.*no bun-version matrix cells/,
+    );
+  });
+
+  test("fails a step-output expression that cannot be proven pinned", () => {
     const unbound = `name: Lane
 on: [push]
 jobs:
@@ -255,6 +319,26 @@ jobs:
 `;
     expectViolation(
       buildRepo({ extra: { "unbound.yml": unbound } }),
+      /unbound expression/,
+    );
+  });
+
+  test("fails a composite action wiring a step-output instead of its input", () => {
+    const action = `name: Setup
+inputs:
+  bun-version:
+    description: "Bun version"
+    required: false
+    default: "${CANONICAL}"
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@${SHA}
+      with:
+        bun-version: \${{ steps.resolve.outputs.version }}
+`;
+    expectViolation(
+      buildRepo({ files: { ".github/actions/setup/action.yml": action } }),
       /unbound expression/,
     );
   });
@@ -275,24 +359,71 @@ jobs:
     );
   });
 
-  test("passes a bun.sh/install pinned to the canonical release tag", () => {
-    const shell = `name: Deploy
-on: [push]
-jobs:
-  deploy:
-    runs-on: ubuntu-24.04
-    steps:
-      - run: |
-          curl -fsSL https://bun.sh/install | bash -s "bun-v${CANONICAL}"
-`;
-    const root = buildRepo({ extra: { "shell.yml": shell } });
-    try {
-      const inventory: InventorySite[] = runContract(root).inventory;
-      const site = inventory.find((s) => s.surface === "shell-install");
-      expect(site.classification).toBe("canonical");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  test("scans shell scripts outside workflows as install surfaces", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "deploy/install.sh": "curl -fsSL https://bun.sh/install | bash\n",
+        },
+      }),
+      /deploy\/install\.sh:1: bun\.sh\/install without the pinned release tag/,
+    );
+  });
+
+  test("fails a Dockerfile whose BUN_VERSION default floats", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "services/runner/Dockerfile": [
+            "FROM node:24-slim",
+            "ARG BUN_VERSION=canary",
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
+            'RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"',
+            "",
+          ].join("\n"),
+        },
+      }),
+      /BUN_VERSION defaults to canary/,
+    );
+  });
+
+  test("fails a floating oven/bun base image and passes canonical variants", () => {
+    expectViolation(
+      buildRepo({ files: { "sim/Dockerfile": "FROM oven/bun:canary\n" } }),
+      /FROM oven\/bun:canary/,
+    );
+    const inventory = inventoryOf(
+      buildRepo({
+        files: {
+          "sim/Dockerfile": `FROM oven/bun:${CANONICAL}-alpine\n`,
+          "runner/Dockerfile": [
+            "FROM node:24-slim",
+            `ARG BUN_VERSION=${CANONICAL}`,
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
+            'RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"',
+            "",
+          ].join("\n"),
+        },
+      }),
+    );
+    const image = inventory.find((s) => s.surface === "dockerfile-base-image");
+    expect(image?.classification).toBe("canonical");
+    const install = inventory.find(
+      (s) => s.surface === "shell-install" && s.file === "runner/Dockerfile",
+    );
+    expect(install?.classification).toBe("canonical");
+  });
+
+  test("fails a divergent oven-sh release download URL", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "infra/bootstrap.yaml.tftpl":
+            "  - su - deploy -c 'curl -fsSL -o /tmp/bun.zip https://github.com/oven-sh/bun/releases/download/bun-v1.3.13/bun-linux-x64.zip'\n",
+        },
+      }),
+      /downloads Bun release bun-v1\.3\.13/,
+    );
   });
 
   test("fails a packageManager declaring a non-canonical Bun", () => {
@@ -303,6 +434,13 @@ jobs:
         },
       }),
       /packageManager is bun@1\.4\.0/,
+    );
+  });
+
+  test("fails loudly on a malformed tracked manifest instead of skipping it", () => {
+    expectViolation(
+      buildRepo({ files: { "packages/bad/package.json": "{ not json" } }),
+      /packages\/bad\/package\.json: tracked manifest failed to parse/,
     );
   });
 
@@ -321,34 +459,31 @@ jobs:
   });
 
   test("classifies workspace type ranges without failing the contract", () => {
-    const root = buildRepo({
-      files: {
-        "package.json": JSON.stringify({
-          packageManager: `bun@${CANONICAL}`,
-          devDependencies: { "bun-types": CANONICAL },
-        }),
-        "packages/a/package.json": JSON.stringify({
-          devDependencies: { "bun-types": "^1.2.0" },
-        }),
-        "packages/b/package.json": JSON.stringify({
-          devDependencies: { "bun-types": "1.3.13" },
-        }),
-      },
-    });
-    try {
-      const inventory: InventorySite[] = runContract(root).inventory;
-      const ranges = inventory.filter(
-        (s) => s.surface === "workspace-type-range",
-      );
-      expect(
-        ranges.find((s) => s.file.includes("packages/a")).classification,
-      ).toBe("compatible-range");
-      expect(
-        ranges.find((s) => s.file.includes("packages/b")).classification,
-      ).toBe("drift");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    const inventory = inventoryOf(
+      buildRepo({
+        files: {
+          "package.json": JSON.stringify({
+            packageManager: `bun@${CANONICAL}`,
+            devDependencies: { "bun-types": CANONICAL },
+          }),
+          "packages/a/package.json": JSON.stringify({
+            devDependencies: { "bun-types": "^1.2.0" },
+          }),
+          "packages/b/package.json": JSON.stringify({
+            devDependencies: { "bun-types": "1.3.13" },
+          }),
+        },
+      }),
+    );
+    const ranges = inventory.filter(
+      (s) => s.surface === "workspace-type-range",
+    );
+    expect(
+      ranges.find((s) => s.file.includes("packages/a"))?.classification,
+    ).toBe("compatible-range");
+    expect(
+      ranges.find((s) => s.file.includes("packages/b"))?.classification,
+    ).toBe("drift");
   });
 
   test("fails a composite action whose bun-version input defaults floating", () => {
@@ -385,20 +520,27 @@ runs:
       with:
         bun-version: \${{ inputs.bun-version }}
 `;
-    const root = buildRepo({
-      files: { ".github/actions/setup/action.yml": action },
-    });
-    try {
-      const inventory: InventorySite[] = runContract(root).inventory;
-      const site = inventory.find((s) => s.surface === "composite-default");
-      expect(site.classification).toBe("canonical");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    const inventory = inventoryOf(
+      buildRepo({ files: { ".github/actions/setup/action.yml": action } }),
+    );
+    const site = inventory.find((s) => s.surface === "composite-default");
+    expect(site?.classification).toBe("canonical");
   });
 
-  test("an explicit allowlist entry permits a deliberate floating cell", () => {
-    const floating = `name: Compat
+  test("rejects an allowlist entry with no reason", () => {
+    expectViolation(
+      buildRepo({ extra: { "compat.yml": gateStub() } }),
+      /has no reason/,
+      {
+        floatingAllowlist: [
+          { file: ".github/workflows/compat.yml", value: "canary", reason: "" },
+        ],
+      },
+    );
+  });
+
+  test("rejects an allowlisted canary that is the file's only runtime", () => {
+    const canaryOnly = `name: Compat
 on: [push]
 jobs:
   canary-cell:
@@ -408,9 +550,10 @@ jobs:
         with:
           bun-version: canary
 `;
-    const root = buildRepo({ extra: { "compat.yml": floating } });
-    try {
-      const inventory: InventorySite[] = runContract(root, {
+    expectViolation(
+      buildRepo({ extra: { "compat.yml": canaryOnly } }),
+      /must run in addition to the canonical/,
+      {
         floatingAllowlist: [
           {
             file: ".github/workflows/compat.yml",
@@ -418,15 +561,45 @@ jobs:
             reason: "upstream compatibility cell (test)",
           },
         ],
-      }).inventory;
-      const site = inventory.find(
-        (s) =>
-          s.file === ".github/workflows/compat.yml" && s.value === "canary",
-      );
-      expect(site.classification).toBe("allowlisted-floating");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+      },
+    );
+  });
+
+  test("permits an allowlisted floating cell beside a canonical lane", () => {
+    const additive = `name: Compat
+on: [push]
+env:
+  BUN_VERSION: "${CANONICAL}"
+jobs:
+  pinned:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: \${{ env.BUN_VERSION }}
+  canary-cell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: oven-sh/setup-bun@${SHA}
+        with:
+          bun-version: canary
+`;
+    const inventory = inventoryOf(
+      buildRepo({ extra: { "compat.yml": additive } }),
+      {
+        floatingAllowlist: [
+          {
+            file: ".github/workflows/compat.yml",
+            value: "canary",
+            reason: "upstream compatibility cell (test)",
+          },
+        ],
+      },
+    );
+    const site = inventory.find(
+      (s) => s.file === ".github/workflows/compat.yml" && s.value === "canary",
+    );
+    expect(site?.classification).toBe("allowlisted-floating");
   });
 
   test("classifyTypeRange models the syntaxes this repo uses", () => {
@@ -448,11 +621,14 @@ jobs:
     expect(canonical).toBe(CANONICAL);
     expect(gateWorkflows.length).toBeGreaterThan(0);
     // The repo genuinely has every surface the contract models; an empty scan
-    // would mean the walker or the YAML readers silently broke.
+    // would mean the tracked-file enumeration or a reader silently broke.
     for (const surface of [
       "workflow-version",
       "setup-bun-ref",
       "shell-install",
+      "release-download",
+      "dockerfile-arg-default",
+      "dockerfile-base-image",
       "packageManager",
       "root-type-anchor",
       "workspace-type-range",
@@ -460,11 +636,18 @@ jobs:
     ]) {
       expect(inventory.some((s) => s.surface === surface)).toBe(true);
     }
+    // The scoped-out boundaries are inventoried as exclusions, never silent.
+    expect(
+      inventory.some((s) => s.classification === "embedded-boundary-excluded"),
+    ).toBe(true);
     expect(
       inventory.filter((s) => s.classification === "floating").length,
     ).toBe(0);
     expect(
       inventory.filter((s) => s.classification === "unreviewed-ref").length,
+    ).toBe(0);
+    expect(
+      inventory.filter((s) => s.classification === "unbound-expression").length,
     ).toBe(0);
   });
 });

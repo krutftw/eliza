@@ -37,7 +37,9 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 
 ENV BUN_INSTALL=/root/.bun \
     PATH=/root/.bun/bin:$PATH
-RUN curl -fsSL https://bun.sh/install | bash -s "canary" \
+# Canonical pinned CI Bun (.github/ci-bun-version.json); enforced by
+# packages/scripts/ci-bun-version-contract.mjs.
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" \
  && bun --version
 
 WORKDIR /workspace

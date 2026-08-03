@@ -27,11 +27,13 @@
  *   2. Every `oven-sh/setup-bun` use is pinned to a reviewed commit SHA and
  *      wires an explicit `bun-version` — the action's implicit default is
  *      `latest`, so an absent key is a floating runtime.
- *   3. Every `bun.sh/install` shell install and every
- *      `oven-sh/bun/releases/download/bun-v…` artifact URL in Dockerfiles,
- *      shell scripts, cloud-init templates, and .mjs installers pins the
- *      canonical version; Dockerfile `ARG/ENV BUN_VERSION` defaults and
- *      `FROM oven/bun:<tag>` base images must be canonical.
+ *   3. Every `bun.sh/install` shell install and every oven-sh Bun release
+ *      artifact URL in Dockerfiles, shell scripts, YAML runtime manifests,
+ *      cloud-init templates, and .mjs installers pins the canonical version;
+ *      `releases/latest` is always floating. A presence-only `command -v bun`
+ *      guard may not preserve an arbitrary preinstalled runtime; it must compare
+ *      `bun --version` with the canonical pin. Dockerfile `ARG/ENV BUN_VERSION`
+ *      defaults and `FROM oven/bun:<tag>` base images must be canonical.
  *   4. Every `packageManager` declaring Bun equals `bun@<canonical>`, and the
  *      root `@types/bun`/`bun-types` anchors equal the canonical version
  *      exactly. Non-root workspace type declarations are classified in the
@@ -59,7 +61,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DEFAULT_REPO_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -122,6 +124,7 @@ const EXCLUDED_SURFACES = [
 const GATE_WORKFLOWS = [
   "ci.yaml",
   "test.yml",
+  "develop-pr.yml",
   "cloud-cf-deploy.yml",
   "app-aesthetic-audit.yml",
   "develop-exhaustive.yml",
@@ -130,6 +133,11 @@ const GATE_WORKFLOWS = [
   "windows-desktop-preload-smoke.yml",
   "feed-env-audit.yml",
 ];
+
+// Both the post-merge suite and the required develop PR gate must execute the
+// contract and publish its exact-head inventory. Keeping the PR lane here is
+// what prevents a runtime drift from merging before test.yml runs on develop.
+const CONTRACT_ENFORCEMENT_WORKFLOWS = new Set(["test.yml", "develop-pr.yml"]);
 
 // A concrete pin: a plain semver, optionally with a prerelease/build suffix.
 // `canary`, `latest`, and `${{ ... }}` expressions deliberately do not match.
@@ -350,6 +358,8 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
     }
   }
 
+  const scannedYamlFiles = new Set(yamlFiles.map(({ rel }) => rel));
+
   for (const { rel, kind, text: preread } of yamlFiles) {
     const text = preread ?? read(rel);
     const lines = text.split("\n");
@@ -535,12 +545,14 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
   }
 
   // --- Invariant 3, non-Action installers: Dockerfiles, shell scripts,
-  // cloud-init templates, and .mjs bootstrap installers. ---
+  // standalone YAML runtime manifests, cloud-init templates, and .mjs
+  // bootstrap installers. Workflow-shaped YAML was scanned above. ---
   for (const rel of tracked) {
     const name = basename(rel);
     const isDockerfile = name.startsWith("Dockerfile");
     const isShellLike = /\.(sh|tftpl|mjs)$/.test(rel);
-    if (!isDockerfile && !isShellLike) continue;
+    const isStandaloneYaml = /\.ya?ml$/.test(rel) && !scannedYamlFiles.has(rel);
+    if (!isDockerfile && !isShellLike && !isStandaloneYaml) continue;
     const excluded = excludedSurface(rel);
     if (excluded) {
       record({
@@ -648,6 +660,28 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
         `${rel}: is a deterministic CI lane but does not wire the canonical Bun pin ${canonical} (${VERSION_FILE}). Expected a BUN_VERSION/bun-version: "${canonical}" literal.`,
       );
     }
+    if (CONTRACT_ENFORCEMENT_WORKFLOWS.has(name)) {
+      if (
+        !/node packages\/scripts\/ci-bun-version-contract\.mjs\s+--inventory\s+["']?\$RUNNER_TEMP\/bun-runtime-inventory\.json/.test(
+          text,
+        )
+      ) {
+        violate(
+          `${rel}: required lane does not execute the Bun contract with an exact-head inventory. Run \`node packages/scripts/ci-bun-version-contract.mjs --inventory "$RUNNER_TEMP/bun-runtime-inventory.json"\`.`,
+        );
+      }
+      if (
+        !text.includes("name: bun-runtime-inventory") ||
+        !text.includes(
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: literal GitHub Actions expression required in the workflow contract
+          "path: ${{ runner.temp }}/bun-runtime-inventory.json",
+        )
+      ) {
+        violate(
+          `${rel}: required lane does not upload the bun-runtime-inventory artifact from the exact PR head.`,
+        );
+      }
+    }
   }
 
   // --- Invariant 4: manifests and type anchors. A tracked package.json that
@@ -724,15 +758,42 @@ export function runContract(repoRoot = DEFAULT_REPO_ROOT, overrides = {}) {
 
 // Shared line scan for the two install idioms that appear outside Action
 // YAML keys: `curl … bun.sh/install | bash …` and direct release-artifact
-// downloads (`oven-sh/bun/releases/download/bun-v<v>/…`). Comment lines are
-// prose, not installs; a `${BUN_VERSION}` reference defers to the same file's
-// validated ARG/ENV default.
+// downloads (`oven-sh/bun/releases/download/bun-v<v>/…`). The GitHub
+// `releases/latest/download` convenience URL is deliberately rejected because
+// it moves without a repository change. Comment lines are prose, not installs;
+// a `${BUN_VERSION}` reference defers to the same file's validated ARG/ENV
+// default.
 function scanInstallLines({ rel, text, canonical, record, violate }) {
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (/^\s*#/.test(line)) continue;
     if (line.includes("bun.sh/install")) {
+      const installGuard = lines
+        .slice(Math.max(0, i - 4), i)
+        .toReversed()
+        .find((candidate) =>
+          /^\s*["'`]?\s*if\s+.*command\s+-v\s+bun/.test(candidate),
+        );
+      if (installGuard !== undefined) {
+        const resolvesCanonicalVersion =
+          installGuard.includes("bun --version") &&
+          (installGuard.includes(canonical) ||
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: shell variable reference, not a JS template
+            installGuard.includes("${BUN_VERSION}"));
+        record({
+          surface: "preinstalled-runtime-guard",
+          file: rel,
+          line: i + 1,
+          value: installGuard.trim(),
+          classification: resolvesCanonicalVersion ? "canonical" : "implicit",
+        });
+        if (!resolvesCanonicalVersion) {
+          violate(
+            `${rel}:${i + 1}: Bun installation is guarded only by executable presence, so an arbitrary preinstalled Bun becomes authoritative. Compare \`bun --version\` with ${canonical} before deciding to skip the pinned install.`,
+          );
+        }
+      }
       const pinned =
         line.includes(`bun-v${canonical}`) ||
         // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile ARG interpolation, not a JS template
@@ -749,6 +810,19 @@ function scanInstallLines({ rel, text, canonical, record, violate }) {
           `${rel}:${i + 1}: bun.sh/install without the pinned release tag — a bare install or a channel argument puts a moving Bun on the host. Use \`bash -s "bun-v${canonical}"\`.`,
         );
       }
+    }
+    if (/oven-sh\/bun\/releases\/latest\/download\//.test(line)) {
+      record({
+        surface: "release-download",
+        file: rel,
+        line: i + 1,
+        value: "latest",
+        classification: "floating",
+      });
+      violate(
+        `${rel}:${i + 1}: downloads Bun from floating releases/latest — use the canonical bun-v${canonical} release URL (${VERSION_FILE}).`,
+      );
+      continue;
     }
     const download = line.match(
       /oven-sh\/bun\/releases\/download\/bun-v(\d+\.\d+\.\d+)/,
@@ -770,7 +844,10 @@ function scanInstallLines({ rel, text, canonical, record, violate }) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
   try {
     const inventoryFlag = process.argv.indexOf("--inventory");
     const { canonical, inventory, concretePins, gateWorkflows } = runContract();

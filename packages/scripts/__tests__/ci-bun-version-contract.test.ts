@@ -6,14 +6,22 @@
  * mutable action tag, implicit setup-bun, expressions whose backing
  * declaration is missing (env, matrix, and composite step-output forms),
  * unpinned bun.sh/install, Dockerfile ARG/FROM drift, divergent release
- * downloads, drifting packageManager and root type anchors, floating
+ * downloads (including releases/latest), presence-only install guards,
+ * drifting packageManager and root type anchors, floating
  * composite-action defaults, allowlist entries that lack a reason or a
  * canonical sibling lane, a malformed tracked manifest, and a missing gate
  * workflow (fail-fast, not skip). Deterministic — no workflow runs, no
  * network.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +31,9 @@ const { runContract, classifyTypeRange } = await import(
 );
 
 const REAL_REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+const CONTRACT_CLI_PATH = fileURLToPath(
+  new URL("../ci-bun-version-contract.mjs", import.meta.url),
+);
 
 interface InventorySite {
   surface: string;
@@ -41,6 +52,7 @@ const SHA = "0c5077e51419868618aeaa5fe8019c62421857d6";
 const GATE_WORKFLOWS = [
   "ci.yaml",
   "test.yml",
+  "develop-pr.yml",
   "cloud-cf-deploy.yml",
   "app-aesthetic-audit.yml",
   "develop-exhaustive.yml",
@@ -66,6 +78,11 @@ jobs:
       - uses: ./.github/actions/setup-bun-workspace
         with:
           bun-version: \${{ env.BUN_VERSION }}
+      - run: node packages/scripts/ci-bun-version-contract.mjs --inventory "$RUNNER_TEMP/bun-runtime-inventory.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: bun-runtime-inventory
+          path: \${{ runner.temp }}/bun-runtime-inventory.json
 `;
 }
 
@@ -370,6 +387,40 @@ jobs:
     );
   });
 
+  test("rejects an install guard that trusts any preinstalled Bun version", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "deploy/install.sh": [
+            "if ! command -v bun >/dev/null 2>&1; then",
+            `  curl -fsSL https://bun.sh/install | bash -s "bun-v${CANONICAL}"`,
+            "fi",
+            "",
+          ].join("\n"),
+        },
+      }),
+      /guarded only by executable presence/,
+    );
+  });
+
+  test("rejects a presence-only guard embedded in a generated script", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "deploy/generate.mjs": [
+            "const script = [",
+            '  "if ! command -v bun >/dev/null 2>&1; then",',
+            `  '  curl -fsSL https://bun.sh/install | bash -s "bun-v${CANONICAL}"',`,
+            '  "fi",',
+            '].join("\\n");',
+            "",
+          ].join("\n"),
+        },
+      }),
+      /guarded only by executable presence/,
+    );
+  });
+
   test("fails a Dockerfile whose BUN_VERSION default floats", () => {
     expectViolation(
       buildRepo({
@@ -423,6 +474,32 @@ jobs:
         },
       }),
       /downloads Bun release bun-v1\.3\.13/,
+    );
+  });
+
+  test("fails a floating latest Bun download in a standalone YAML manifest", () => {
+    expectViolation(
+      buildRepo({
+        files: {
+          "packaging/snap/snapcraft.yaml":
+            'override-build: curl -fsSL "https://github.com/oven-sh/bun/releases/latest/download/bun-linux-x64.zip" -o /tmp/bun.zip\n',
+        },
+      }),
+      /downloads Bun from floating releases\/latest/,
+    );
+  });
+
+  test("fails when the required develop PR gate drops contract enforcement", () => {
+    expectViolation(
+      buildRepo({
+        overrides: {
+          "develop-pr.yml": gateStub().replace(
+            /\s+- run: node packages\/scripts\/ci-bun-version-contract\.mjs --inventory[^\n]+/,
+            "",
+          ),
+        },
+      }),
+      /develop-pr\.yml: required lane does not execute the Bun contract/,
     );
   });
 
@@ -626,6 +703,7 @@ jobs:
       "workflow-version",
       "setup-bun-ref",
       "shell-install",
+      "preinstalled-runtime-guard",
       "release-download",
       "dockerfile-arg-default",
       "dockerfile-base-image",
@@ -649,5 +727,30 @@ jobs:
     expect(
       inventory.filter((s) => s.classification === "unbound-expression").length,
     ).toBe(0);
-  });
+  }, 15_000);
+
+  test("the contract CLI executes directly and writes an inventory on this platform", () => {
+    const root = mkdtempSync(join(tmpdir(), "ci-bun-version-contract-cli-"));
+    const inventoryPath = join(root, "inventory.json");
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [CONTRACT_CLI_PATH, "--inventory", inventoryPath],
+        {
+          cwd: REAL_REPO_ROOT,
+          encoding: "utf8",
+        },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain(
+        "ci bun version contract passed (canonical 1.3.14",
+      );
+      const inventory = JSON.parse(readFileSync(inventoryPath, "utf8"));
+      expect(inventory.canonical).toBe(CANONICAL);
+      expect(inventory.sites.length).toBeGreaterThan(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

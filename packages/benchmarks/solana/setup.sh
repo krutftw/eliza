@@ -35,11 +35,12 @@ fi
 echo "  ✓ uv: $(uv --version)"
 
 # Check Bun
-if ! command -v bun &>/dev/null; then
-    echo "  ⚠ Bun not found. Installing..."
+if ! command -v bun &>/dev/null || [ "$(bun --version)" != "1.3.14" ]; then
+    echo "  ⚠ Canonical Bun 1.3.14 not found. Installing..."
     curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" # pinned: canonical CI Bun (.github/ci-bun-version.json)
     export PATH="$HOME/.bun/bin:$PATH"
 fi
+test "$(bun --version)" = "1.3.14"
 echo "  ✓ Bun: $(bun --version)"
 
 # Check Surfpool

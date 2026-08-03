@@ -41,7 +41,7 @@ permissions:
 
 env:
   CI: "true"
-  BUN_VERSION: "canary"
+  BUN_VERSION: "1.3.14" # pinned: canonical CI Bun (.github/ci-bun-version.json); floating canary/latest breaks --frozen-lockfile (#11184/#9454)
   NODE_VERSION: "24"
   NODE_OPTIONS: "--max-old-space-size=4096"
   # Keyless guarantee: the deterministic harness must pass with every provider

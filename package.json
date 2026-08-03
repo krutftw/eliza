@@ -241,7 +241,7 @@
     "sync:artifacts": "bun packages/scripts/sync-artifacts.mjs",
     "check:view-bundles": "bun packages/scripts/view-bundle-import-guard.mjs"
   },
-  "packageManager": "bun@1.4.0",
+  "packageManager": "bun@1.3.14",
   "workspaces": [
     "packages/*",
     "!packages/feed",

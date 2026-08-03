@@ -1,4 +1,4 @@
-FROM oven/bun:canary-debian
+FROM oven/bun:1.3.14-debian
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

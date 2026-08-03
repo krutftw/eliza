@@ -305,10 +305,11 @@ jobs:
             git checkout -B "$BRANCH" "origin/$BRANCH"
 
             # Install runtime dependencies and regenerate lightweight assets.
-            if ! command -v bun >/dev/null 2>&1; then
+            if ! command -v bun >/dev/null 2>&1 || [ "$(bun --version)" != "1.3.14" ]; then
               curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" # pinned: canonical CI Bun (.github/ci-bun-version.json)
               export PATH="$BUN_INSTALL/bin:$PATH"
             fi
+            test "$(bun --version)" = "1.3.14"
             for attempt in 1 2 3; do
               if bun install --no-save --ignore-scripts; then
                 break
